@@ -10,7 +10,7 @@ class ImageSiamese(SiameseNetwork):
         
         super().__init__(** kwargs)
     
-    def build_encoder(self, embedding_dim = 28, ** kwargs):
+    def build_encoder(self, embedding_dim = 28, normalize = None, ** kwargs):
         """ Create a simple cnn architecture with default config fitted for MNIST """
         cnn_config = {
             'architecture_name' : 'simple_cnn',

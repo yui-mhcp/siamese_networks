@@ -26,12 +26,13 @@ See [my base project](https://github.com/yui-mhcp/base_dl_project) for more info
 
 ## Available models
 
-| Classes   | Dataset   | Architecture  | Embedding dim | Trainer   | Weights   |
-| :-------: | :-------: | :-----------: | :-----------: | :-------: | :-------: |
-| mel-spectrogram   | [LibriSpeech](http://www.openslr.org/12)  | `CNN 1D + LSTM`   | 256   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/drive/folders/1r3KHaYTtlxm4rio7qsgwEC8Dy9YVYhfG?usp=sharing)  |
-| 10-digit  | `MNIST`   | `ImageSiamese`    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/drive/folders/1NmyB8hVAGmbpDJLHCM8aiLa7C-AfG41j?usp=sharing)  |
-| 10        | `Fashion MNIST`   | `ImageSiamese`    | 64    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/drive/folders/1TdlHhrQRjgTv_Jqyj_kEO53RlqIJiIy7?usp=sharing)  |
-| 10        | `Fashion MNIST`   | `ImageSiamese`    | 64    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/drive/folders/1e6xpAtVAglhUpMYfJjGnuPQcsPARA6R8?usp=sharing)  |
+| Input types   | Dataset   | Architecture  | Embedding dim | Trainer   | Weights   |
+| :-----------: | :-------: | :-----------: | :-----------: | :-------: | :-------: |
+| mel-spectrogram   | [LibriSpeech](http://www.openslr.org/12)  | `AudioSiamese (CNN 1D + LSTM)`   | 256   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1-WWfmQs7pGRQpcZPI6mn9c4FTWnrHZem/view?usp=sharing)  |
+| text (tokens) | [SNLI](https://nlp.stanford.edu/projects/snli/)  | `TextSiamese (BERT + Bi-LSTM)`   | 512   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/17s2PTlI33C23pEvucK0dagCINEW7g0DH/view?usp=sharing)  |
+| 10-digit  | `MNIST`   | `ImageSiamese`    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1NaArsbICsb8lvPuOLKgw_fOHPKsU3YBC/view?usp=sharing)  |
+| 10        | `Fashion MNIST`   | `ImageSiamese`    | 64    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/13V9uKj-6U2jZDN9w-tSIl64ACybZwVZ2/view?usp=sharing)  |
+| 10        | `Fashion MNIST`   | `ImageSiamese`    | 64    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1CqY-CrsWCkKNqYuewFe2t9leWb3QSDfQ/view?usp=sharing)  |
 
 
 Models must be unzipped in the `pretrained_models/` directory !
@@ -228,4 +229,4 @@ Tutorials :
 - [2] [Medium tutorial for speaker verification with siamese networks](https://medium.com/analytics-vidhya/building-a-speaker-identification-system-from-scratch-with-deep-learning-f4c4aa558a56) : the 1st tutorial I read on siamese networks. Its architecture was a 1st base model I improved. Clear, practical and with an interesting comparison between a classical classifier and a siamese-based approach. 
 
 Github project : 
-- [voicemap project](https://github.com/oscarknagg/voicemap) : github associated with the 2nd tutorial
+- [voicemap project](https://github.com/oscarknagg/voicemap) : github associated with the 2nd tutorial and my 1st inspiration for the `AudioSiamese` model

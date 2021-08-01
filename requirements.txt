@@ -1,6 +1,6 @@
 pytube3
 noisereduce
-tensorflow==2.3.2
+tensorflow
 moviepy
 num2words
 pydub
