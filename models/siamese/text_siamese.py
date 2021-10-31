@@ -3,14 +3,16 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from utils.text import TextEncoder
+from utils import truncate, concat_sequences
+from utils.text import get_encoder, random_mask
 from models.siamese.siamese_network import SiameseNetwork
-from custom_architectures.transformers_arch.bert_arch import BertEmbedding
+from custom_architectures.transformers_arch import get_pretrained_transformer_encoder
 
 class TextSiamese(SiameseNetwork):
     def __init__(self,
                  lang,
                  
+                 truncate   = None,
                  max_input_length   = 512,
                  use_fixed_length_input = False,
                  
@@ -18,41 +20,41 @@ class TextSiamese(SiameseNetwork):
                  
                  ** kwargs
                 ):
+        assert truncate in (None, False, 'random', 'start', 'end')
+        
         self.lang   = lang
+        self.truncate   = truncate
         self.max_input_length   = max_input_length
         self.use_fixed_length_input = use_fixed_length_input
         
         # Initialization of Text Encoder
-        if text_encoder is None: text_encoder = {}
-        if isinstance(text_encoder, dict):
-            text_encoder['use_sos_and_eos'] = False
-            if 'vocab' not in text_encoder:
-                text_encoder['vocab'] = get_symbols(lang, arpabet = False)
-                text_encoder['level'] = 'char'
-            else:
-                text_encoder.setdefault('level', 'char')
-            text_encoder.setdefault('cleaners', ['french_cleaners'] if lang == 'fr' else ['english_cleaners'])
-            self.text_encoder = TextEncoder(** text_encoder)
-        
-        elif isinstance(text_encoder, str):
-            self.text_encoder = TextEncoder.load_from_file(text_encoder)
-        elif isinstance(text_encoder, TextEncoder):
-            self.text_encoder = text_encoder
-        else:
-            raise ValueError("input encoder de type inconnu : {}".format(text_encoder))
+        self.text_encoder = get_encoder(text_encoder = text_encoder, lang = lang)
         
         
-        super().__init__(**kwargs)
+        super().__init__(** kwargs)
                 
         # Saving text encoder
         if not os.path.exists(self.text_encoder_file):
             self.text_encoder.save_to_file(self.text_encoder_file)
-        
-        if hasattr(self.siamese, '_build'): self.siamese._build()
     
+    def init_train_config(self,
+                          max_input_length  = None,
+                          nb_mask   = 1,
+                          min_mask_length   = 1,
+                          max_mask_length   = 1,
+                          ** kwargs
+                         ):
+        if max_input_length: self.max_input_length   = max_input_length
+        
+        self.nb_mask = nb_mask
+        self.min_mask_length = min_mask_length
+        self.max_mask_length = max_mask_length
+        
+        super().init_train_config(** kwargs)
+
     def build_encoder(self, embedding_dim = 512, pretrained = 'bert-base-uncased', ** kwargs):
         """ Create a simple cnn architecture with default config fitted for MNIST """
-        return BertEmbedding.from_pretrained(
+        return get_pretrained_transformer_encoder(
             pretrained, output_dim = embedding_dim, return_attention = False, ** kwargs
         )
         
@@ -60,6 +62,15 @@ class TextSiamese(SiameseNetwork):
     def text_encoder_file(self):
         return os.path.join(self.save_dir, 'text_encoder.json')
     
+    @property
+    def training_hparams(self):
+        return super().training_hparams(
+            max_input_length = None,
+            nb_mask = 1,
+            min_mask_length = 1,
+            max_mask_length = 1
+        )
+
     @property
     def encoder_input_signature(self):
         return (
@@ -80,8 +91,8 @@ class TextSiamese(SiameseNetwork):
         return self.text_encoder.blank_token_idx
 
     @property
-    def go_frame(self):
-        return tf.zeros((1, self.n_mel_channels), dtype = tf.float32)
+    def mask_token_idx(self):
+        return self.text_encoder[self.text_encoder.mask_token]
     
     def __str__(self):
         des = super().__str__()
@@ -105,31 +116,32 @@ class TextSiamese(SiameseNetwork):
         encoded_text = tf.py_function(self.encode_text, [data['text']], Tout = tf.int32)
         encoded_text.set_shape([None])
         
-        if tf.shape(encoded_text)[0] > self.max_input_length:
-            start = tf.random.uniform(
-                (), minval = 0, 
-                maxval = tf.shape(encoded_text)[0] - self.max_input_length,
-                dtype = tf.int32
-            )
-            encoded_text = encoded_text[start : start + self.max_input_length]
+        if self.truncate not in (None, False):
+            encoded_text = truncate(encoded_text, self.max_input_length, keep_mode = self.truncate)
         
         return encoded_text, len(encoded_text)
+    
+    def filter_input(self, inp):
+        return inp[1] <= self.max_input_length
+    
+    def augment_input(self, inp):
+        tokens, length = inp
+        tokens = tf.cond(
+            tf.random.uniform(()) < self.augment_prct,
+            lambda: random_mask(
+                tokens, self.mask_token_idx, min_idx = 1, max_idx = len(inp) - 1, nb_mask = self.nb_mask,
+                min_mask_length = self.min_mask_length, max_mask_length = self.max_mask_length
+            ),
+            lambda: tokens
+        )
+        return tokens, len(tokens)
     
     def concat(self, x_same, x_not_same):
         x_same_txt, x_same_length = x_same
         x_not_same_txt, x_not_same_length = x_not_same
         
-        seq_1, seq_2 = tf.shape(x_same_txt)[1], tf.shape(x_not_same_txt)[1]
-        
-        if seq_1 != seq_2:
-            padding = [(0,0), (0, tf.abs(seq_1 - seq_2))]
-            if seq_1 > seq_2:
-                x_not_same_txt = tf.pad(x_not_same_txt, padding, constant_values = self.blank_token_idx)
-            else:
-                x_same_txt = tf.pad(x_same_txt, padding, constant_values = self.blank_token_idx)
-                
         return (
-            tf.concat([x_same_txt, x_not_same_txt], axis = 0),
+            concat_sequences(x_same_txt, x_not_same_txt, pad_value = self.blank_token_idx),
             tf.concat([x_same_length, x_not_same_length], axis = 0)
         )
     
@@ -156,6 +168,7 @@ class TextSiamese(SiameseNetwork):
         config = super().get_config(* args, ** kwargs)
         config['lang']      = self.lang
         
+        config['truncate']  = self.truncate
         config['max_input_length']  = self.max_input_length
         config['use_fixed_length_input']    = self.use_fixed_length_input
         

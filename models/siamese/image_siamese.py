@@ -36,6 +36,12 @@ class ImageSiamese(SiameseNetwork):
         }
         return get_architecture(** cnn_config)
     
+    @property
+    def encoder_input_shape(self):
+        input_shape = self.input_size
+        if not isinstance(input_shape, (list, tuple)): input_shape = (input_shape, input_shape, 1)
+        return (None, ) + tuple(input_shape)
+    
     def get_input(self, data):
         """
             Return image / list of images based on the type of `data` 
