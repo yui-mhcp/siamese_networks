@@ -15,12 +15,15 @@
 # limitations under the License.
 """ TF 2.0 BART model. """
 
+import numpy as np
 import tensorflow as tf
 
 from hparams.hparams import HParams
 from custom_layers import FasterEmbedding, get_activation
 from custom_architectures.transformers_arch.transformer_arch import *
 from custom_architectures.transformers_arch.embedding_head import EmbeddingHead, HParamsEmbeddingHead
+
+_supported_subsamplings = ('select', 'conv', 'separable', 'dense', 'min', 'max', 'mean')
 
 __base_bart_config = {
     'vocab_size'    : -1,
@@ -37,7 +40,8 @@ HParamsBartEncoder  = HParamsTransformerEncoder(
     subsampling_step    = -1,
     subsampling_offset  = 1,
     subsampling_mode    = 'select',
-    subsample_after     = True
+    subsample_after     = True,
+    subsampling_drop_rate   = 0.
 )
 HParamsBartEmbedding    = HParamsBartEncoder(** HParamsEmbeddingHead)
 
@@ -79,12 +83,25 @@ class BartEncoder(tf.keras.Model):
         self.dropout    = tf.keras.layers.Dropout(self.hparams.drop_rate)
         
         self.subsampling_layer  = None
+        self.subsampling_drop_layer = tf.keras.layers.Dropout(
+            self.hparams.subsampling_drop_rate
+        ) if self.hparams.subsampling_drop_rate > 0 else None
+        
         if self.hparams.subsampling_step > 1:
-            assert self.hparams.subsampling_mode in ('select', 'conv', 'min' 'max', 'mean'), "Unknown subsampling mode : {}".format(self.hparams.subsampling_mode)
+            assert self.hparams.subsampling_mode in _supported_subsamplings, "Unknown subsampling mode : \n  Accepted : {}\n  Got : {}".format(self.hparams.subsampling_mode, _supported_subsamplings)
             if self.hparams.subsampling_mode == 'conv':
                 self.subsampling_layer = tf.keras.layers.Conv1D(
                     filters = self.embedding_dim, kernel_size = self.hparams.subsampling_step,
                     strides = self.hparams.subsampling_step, padding = 'valid', name = 'subsampling_layer'
+                )
+            elif self.hparams.subsampling_mode == 'separable':
+                self.subsampling_layer = tf.keras.layers.SeparableConv1D(
+                    filters = self.embedding_dim, kernel_size = self.hparams.subsampling_step,
+                    strides = self.hparams.subsampling_step, padding = 'valid', name = 'subsampling_layer'
+                )
+            elif self.hparams.subsampling_mode == 'dense':
+                self.subsampling_layer = tf.keras.layers.Dense(
+                    units = self.embedding_dim, name = 'subsampling_layer'
                 )
     
     @property
@@ -109,6 +126,16 @@ class BartEncoder(tf.keras.Model):
         text_length = tf.fill([batch_size, 1], seq_len)
         
         self([text, text_length], training = False)
+        self._maybe_init_subsampling_layer()
+
+    def _maybe_init_subsampling_layer(self):
+        if self.subsampling_layer is None or self.hparams.subsampling_mode != 'dense': return
+        
+        w = np.zeros(self.subsampling_layer.weights[0].shape)
+        for i in range(self.embedding_dim):
+            w[i::self.embedding_dim, i] = 1
+        w /= self.hparams.subsampling_step
+        self.subsampling_layer.set_weights([w, np.zeros(self.subsampling_layer.weights[1].shape)])
         
     def freeze(self, trainable = False):
         self.token_embedding_layer.trainable    = trainable
@@ -116,13 +143,18 @@ class BartEncoder(tf.keras.Model):
         self.encoder.trainable  = trainable 
         self.norm.trainable     = trainable 
 
-    def embed_tokens(self, text, training = False, positional_offset = -1):
+    def embed_tokens(self, text, training = False, positional_offset = -1, repeat_position = -1):
         if positional_offset == -1: positional_offset = self.hparams.positional_offset
         seq_len = tf.shape(text)[1]
         
-        pos_ids = tf.expand_dims(tf.range(seq_len) + positional_offset, axis = 0)
+        if repeat_position > 1:
+            pos_ids = tf.repeat(tf.range(seq_len // repeat_position + 1), repeat_position)[:seq_len]
+        else:
+            pos_ids = tf.range(seq_len)
         
-        if len(tf.shape(text)) == 3:
+        pos_ids = tf.expand_dims(pos_ids + positional_offset, axis = 0)
+        
+        if len(tf.shape(text)) == 3 and text.dtype == tf.float32:
             token_embedded = text * self.embedding_factor
         else:
             token_embedded = self.token_embedding_layer(text) * self.embedding_factor
@@ -133,8 +165,24 @@ class BartEncoder(tf.keras.Model):
         
         return embedded
     
+    def pad_to_multiple(self, output, mask = None):
+        rest = tf.shape(output)[1] % self.hparams.subsampling_step
+        if rest != 0:
+            output = tf.pad(output, [(0, 0), (0, self.hparams.subsampling_step - rest), (0, 0)])
+            
+            if mask is not None:
+                mask = tf.pad(
+                    mask, [(0, 0), (0, 0), (0, 0), (0, self.hparams.subsampling_step - rest)],
+                    constant_values = 1
+                )
+        
+        return output, mask
+
     def subsample(self, output, mask = None, training = False):
         if self.hparams.subsampling_step <= 1: return output, mask
+        
+        if self.subsampling_drop_layer is not None:
+            output = self.subsampling_drop_layer(output, training = training)
         
         if self.hparams.subsampling_mode == 'select':
             indices = tf.range(self.hparams.subsampling_offset, tf.shape(output)[1], self.hparams.subsampling_step)
@@ -145,7 +193,7 @@ class BartEncoder(tf.keras.Model):
             if mask is not None:
                 mask = tf.gather(tf.squeeze(mask, [1, 2]), indices, batch_dims = 1)
                 mask = tf.reshape(mask, [tf.shape(output)[0], 1, 1, -1])
-        elif self.hparams.subsampling_mode == 'conv':
+        elif self.hparams.subsampling_mode in ('conv', 'separabl'):
             output = self.subsampling_layer(output, training = training)
             
 
@@ -155,16 +203,19 @@ class BartEncoder(tf.keras.Model):
 
                 mask = tf.gather(tf.squeeze(mask, [1, 2]), indices, batch_dims = 1)
                 mask = tf.reshape(mask, [tf.shape(output)[0], 1, 1, -1])
+        elif self.hparams.subsampling_mode == 'dense':
+            output, mask = self.pad_to_multiple(output, mask)
+            
+            output = tf.reshape(
+                output, [tf.shape(output)[0], -1, self.hparams.subsampling_step * tf.shape(output)[-1]]
+            )
+            output = self.subsampling_layer(output)
+            
+            if mask is not None:
+                mask = tf.reshape(mask, [tf.shape(output)[0], 1, 1, -1, self.hparams.subsampling_step])
+                mask = tf.reduce_min(mask, axis = -1)
         else:
-            rest = tf.shape(output)[1] % self.hparams.subsampling_step
-            if rest != 0:
-                output = tf.pad(output, [(0, 0), (0, self.hparams.subsampling_step - rest), (0, 0)])
-                
-                if mask is not None:
-                    mask = tf.pad(
-                        mask, [(0, 0), (0, 0), (0, 0), (0, self.hparams.subsampling_step - rest)],
-                        constant_values = 1
-                    )
+            output, mask = self.pad_to_multiple(output, mask)
             
             output = tf.reshape(
                 output, [tf.shape(output)[0], -1, self.hparams.subsampling_step, tf.shape(output)[-1]]
@@ -365,6 +416,7 @@ class BartDecoder(tf.keras.Model):
         
         return embedded
 
+    @tf.function(experimental_relax_shapes = True)
     def call(self,
              inputs,
              mask   = None,
@@ -387,9 +439,8 @@ class BartDecoder(tf.keras.Model):
         batch_size  = tf.shape(text)[0]
         out_seq_len = tf.shape(text)[1]
         
-        
         embedded = self.embed_tokens(text, training = training, positional_offset = positional_offset)
-
+        
         decoder_outputs, attn_weights, states, mask = self.decoder(
             [encoder_out, embedded],
             mask    = mask,
@@ -436,16 +487,19 @@ class BartDecoder(tf.keras.Model):
         assert self.hparams.sos_token is not None and self.hparams.eos_token is not None
         if max_length is None: max_length = self.hparams.max_input_length
 
+        attn_weights, states = {}, {}
+        
         batch_size  = tf.shape(encoder_output)[0]
         
         tokens      = tf.fill((batch_size, 1), self.hparams.sos_token)
         output      = tf.zeros((batch_size, 1, self.vocab_size), dtype = tf.float32)
         logits      = output
         finished    = tf.zeros((batch_size,), dtype = tf.int32)
+        lengths     = tf.fill((batch_size,), 1)
         
         while tf.shape(tokens)[1] < max_length:
             output, logits, attn_weights, states, mask = self(
-                [encoder_output, tokens],
+                [encoder_output, tokens, lengths],
                 training    = training,
                 enc_padding_mask    = enc_padding_mask,
                 return_attention    = True,
@@ -455,7 +509,7 @@ class BartDecoder(tf.keras.Model):
                 ** kwargs
             )
             
-            next_token = tf.argmax(output[:, -1], axis = -1, output_type = tokens.dtype)
+            next_token  = tf.argmax(output[:, -1], axis = -1, output_type = tokens.dtype)
             
             tokens      = tf.concat([tokens, tf.reshape(next_token, [batch_size, 1])], axis = -1)
             finished    = tf.maximum(
@@ -463,6 +517,8 @@ class BartDecoder(tf.keras.Model):
             )
             if early_stopping and tf.reduce_sum(finished) == batch_size:
                 break
+            
+            lengths += 1 - finished
         
         return self.decoder.format_output(
             output, logits = logits, attn_weights = attn_weights, states = states, mask = mask,
