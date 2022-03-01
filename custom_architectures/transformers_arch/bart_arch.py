@@ -1,3 +1,15 @@
+
+# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Licenced under the Affero GPL v3 Licence (the "Licence").
+# you may not use this file except in compliance with the License.
+# See the "LICENCE" file at the root of the directory for the licence information.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """ TF 2.0 BART model, compatible with the `transformers`' model. """
 
 import numpy as np
@@ -102,9 +114,10 @@ class BartDecoder(TextTransformerDecoder):
         self.final_act_layer    = get_activation(self.hparams.final_activation)
     
     @timer
-    def compute_output(self, output, training = False, mask = None, ** kwargs):
+    def compute_output(self, output, training = False, mask = None, apply_softmax = True,
+                       ** kwargs):
         output = self.embeddings.linear(output) + self.final_bias
-        if self.final_act_layer is not None:
+        if self.final_act_layer is not None and apply_softmax:
             output = self.final_act_layer(output)
         return output
         
