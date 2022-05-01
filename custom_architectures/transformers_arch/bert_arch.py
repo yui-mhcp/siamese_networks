@@ -82,7 +82,7 @@ class BaseBERT(TextTransformerEncoder):
                         pretrained      = None,
                         ** kwargs
                        ):
-        from models.weights_converter import partial_transfer_learning
+        from models.weights_converter import partial_transfer_learning, print_vars
         
         if pretrained is None:
             with tf.device('cpu') as d:

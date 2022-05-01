@@ -10,5 +10,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from custom_train_objects.generators.audio_siamese_generator import AudioSiameseGenerator
-from custom_train_objects.generators.image_siamese_generator import ImageSiameseGenerator
+import os
+import glob
+
+def __load():
+    for test_filename in glob.glob('unitest/tests/*.py'):
+        if '__init__' in test_filename: continue
+            
+        module_name = test_filename.replace(os.path.sep, '.').replace('/', '.')[: -3]
+
+        module = __import__(module_name)
+
+__load()

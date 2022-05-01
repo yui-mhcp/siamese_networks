@@ -20,8 +20,6 @@ from custom_layers import FasterEmbedding, get_activation
 from custom_architectures.transformers_arch.embedding_head import EmbeddingHead, HParamsEmbeddingHead
 from custom_architectures.transformers_arch.text_transformer_arch import *
 
-_supported_subsamplings = ('select', 'conv', 'separable', 'dense', 'min', 'max', 'mean')
-
 HParamsBartEncoder      = HParamsTextTransformerEncoder
 HParamsBartEmbedding    = HParamsBartEncoder(** HParamsEmbeddingHead)
 
@@ -113,6 +111,10 @@ class BartDecoder(TextTransformerDecoder):
         )
         self.final_act_layer    = get_activation(self.hparams.final_activation)
     
+    @property
+    def output_last_dim(self):
+        return self.vocab_size
+    
     @timer
     def compute_output(self, output, training = False, mask = None, apply_softmax = True,
                        ** kwargs):
@@ -120,7 +122,7 @@ class BartDecoder(TextTransformerDecoder):
         if self.final_act_layer is not None and apply_softmax:
             output = self.final_act_layer(output)
         return output
-        
+    
     def transfer_weights(self, pretrained):
         from models.weights_converter import partial_transfer_learning, print_vars
         offset, n_enc_layer_weights = 2, 16

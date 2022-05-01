@@ -23,8 +23,10 @@ from custom_architectures.transformers_arch.transformer_arch import format_outpu
 TransformerInferenceOutput = collections.namedtuple(
     "TransformerInferenceOutput", [
         "tokens",
+        "lengths",
         "output",
-        "score"
+        "score",
+        "attention_weights"
     ]
 )
 
@@ -35,17 +37,29 @@ TransformerInferenceState   = collections.namedtuple(
         "padding_mask",
         "finished",
         "logits",
-        "scores"
+        "scores",
+        "attention_weights"
     ]
 )
-def get_shape_invariant():
+def get_shape_invariant(model, encoder_output = None, return_attention = None, ** kwargs):
+    logits_shape, attn_shapes = model.get_output_shape(
+        (None, None),
+        encoder_output      = encoder_output.shape,
+        return_attention    = return_attention,
+        return_last_attention   = True
+    )
+    attn_shapes = {
+        k : tf.TensorSpec(shape = v, dtype = tf.float32) for k, v in attn_shapes.items()
+    }
+    
     return TransformerInferenceState(
         tokens          = tf.TensorSpec(shape = (None, None),       dtype = tf.int32),
         input_length    = tf.TensorSpec(shape = (None, 1),          dtype = tf.int32),
         padding_mask    = tf.TensorSpec(shape = (None, 1, 1, None), dtype = tf.float32),
         finished        = tf.TensorSpec(shape = (None, ),           dtype = tf.int32),
-        logits          = tf.TensorSpec(shape = (None, None, None), dtype = tf.float32),
-        scores          = tf.TensorSpec(shape = (None, ),           dtype = tf.float32)
+        logits          = tf.TensorSpec(shape = (logits_shape),     dtype = tf.float32),
+        scores          = tf.TensorSpec(shape = (None, ),           dtype = tf.float32),
+        attention_weights   = attn_shapes
     )
 
 @timer
@@ -104,16 +118,17 @@ def _infer(model,
 
            return_state       = None,
            return_attention   = None,
+           return_last_attention    = None,
            return_hidden_states   = None,
            return_mask        = None,
            as_dict    = False,
 
            ** kwargs
           ):
-    def cond(tokens, input_length, padding_mask, finished, logits, scores):
+    def cond(tokens, input_length, padding_mask, finished, logits, scores, attn_weights):
         return not (early_stopping and tf.reduce_sum(finished) == batch_size)
     
-    def body(tokens, input_length, padding_mask, finished, logits, scores):
+    def body(tokens, input_length, padding_mask, finished, logits, scores, attn_weights):
         outputs = model(
             tokens,
             input_length    = input_length,
@@ -125,6 +140,7 @@ def _infer(model,
             
             return_state    = use_cache,
             return_attention    = return_attention,
+            return_last_attention   = True,
             return_hidden_states    = return_hidden_states,
             return_mask = return_mask,
             as_dict = True,
@@ -158,8 +174,11 @@ def _infer(model,
             padding_mask    = padding_mask,
             finished    = finished,
             logits      = logits,
-            scores      = scores
+            scores      = scores,
+            attention_weights   = outputs.attention_weights if not skip_attention else attn_weights
         )
+    
+    skip_attention = not return_attention and not return_last_attention
     
     batch_size  = 1
     if encoder_output is not None:
@@ -179,6 +198,9 @@ def _infer(model,
     if padding_mask is None:
         padding_mask    = create_padding_mask(tokens, seq_len = input_length, dtype = tf.float32)
 
+    shapes_invariant    = get_shape_invariant(
+        model, encoder_output = encoder_output, return_attention = return_attention
+    )
     outputs = tf.while_loop(
         cond    = cond,
         body    = body,
@@ -188,16 +210,22 @@ def _infer(model,
             padding_mask    = padding_mask,
             finished    = tf.zeros((batch_size,), dtype = tf.int32),
             logits      = tf.zeros((batch_size, 1, tf.shape(encoder_output)[-1])),
-            scores      = tf.zeros((batch_size, ))
+            scores      = tf.zeros((batch_size, )),
+            attention_weights   = {
+                k : tf.zeros([d if d is not None else 1 for d in shape.shape])
+                for k, shape in shapes_invariant.attention_weights.items()
+            }
         ),
-        shape_invariants    = get_shape_invariant(),
+        shape_invariants    = shapes_invariant,
         maximum_iterations  = max_length
     )
     
     return TransformerInferenceOutput(
         tokens  = outputs.tokens[..., 1:],
+        lengths = tf.reshape(outputs.input_length, [-1]),
         score   = _score_output(outputs.logits, outputs.tokens[..., 1:]),
-        output  = outputs.logits
+        output  = outputs.logits,
+        attention_weights   = outputs.attention_weights if not skip_attention else None
     )
 
 def _infer_beam_search(model,
@@ -208,6 +236,7 @@ def _infer_beam_search(model,
                        initial_state     = None,
 
                        temperature  = 1.,
+                       length_temperature   = 0.,
                        length_power = 0.,
                        num_beams    = 10,
                        num_sentences    = 5,
@@ -225,19 +254,20 @@ def _infer_beam_search(model,
 
                        return_state       = None,
                        return_attention   = None,
+                       return_last_attention    = None,
                        return_hidden_states   = None,
                        return_mask        = None,
                        as_dict    = False,
 
                        ** kwargs
                       ):
-    def cond(tokens, input_length, padding_mask, finished, logits, scores):
+    def cond(tokens, input_length, padding_mask, finished, logits, scores, attn_weights):
         if not early_stopping: return True
 
         finished_per_batch = tf.reshape(finished, [batch_size, -1])
         return tf.reduce_sum(finished_per_batch[:,:num_sentences]) != batch_size * num_sentences
     
-    def body(tokens, input_length, padding_mask, finished, logits, scores):
+    def body(tokens, input_length, padding_mask, finished, logits, scores, attn_weights):
         outputs = model(
             tokens,
             input_length    = input_length,
@@ -250,6 +280,7 @@ def _infer_beam_search(model,
             
             return_state    = use_cache,
             return_attention    = return_attention,
+            return_last_attention   = True,
             return_hidden_states    = return_hidden_states,
             return_mask = return_mask,
             as_dict = True,
@@ -261,6 +292,16 @@ def _infer_beam_search(model,
         logits  = outputs.output[:, -1, :]
         if temperature != 1.:
             logits = logits / temperature
+        
+        if length_temperature != 0.:
+            _lengths = tf.cast(input_length + 1, tf.float32)
+            if length_temperature == -1.:
+                temp = tf.maximum(tf.math.log(_lengths), 1.)
+            else:
+                temp = _lengths ** length_temperature
+            temp = 1. / temp
+
+            logits = logits / temp
         
         beam_scores = log_softmax(logits, axis = -1) * finish_mask
         beam_scores = beam_scores + tf.expand_dims(scores, axis = 1)
@@ -275,9 +316,9 @@ def _infer_beam_search(model,
             mask    = 1. - (mask * tf.expand_dims(tf.cast(finished, tf.float32), axis = 1))
 
         reshaped_scores = beam_scores * mask + (1. - mask) * -1e4
-        reshaped_scores = reshaped_scores / tf.cast(input_length, tf.float32) ** length_power
+        reshaped_scores = reshaped_scores / (tf.cast(input_length, tf.float32) ** length_power)
         reshaped_scores = tf.reshape(reshaped_scores, [batch_size, -1])
-        
+
         next_token  = _select_next_token(
             reshaped_scores, n = num_beams, previous = None, use_sampling = use_sampling
         )
@@ -291,6 +332,12 @@ def _infer_beam_search(model,
         input_length    = tf.gather(input_length,   token_batch_idx)
         finished        = tf.gather(finished,       token_batch_idx)
         padding_mask    = tf.gather(padding_mask,   token_batch_idx)
+        if return_attention:
+            attention_weights   = {
+                k : tf.gather(attn, token_batch_idx) for k, attn in outputs.attention_weights.items()
+            }
+        else:
+            attention_weights   = outputs.attention_weights
         
         scores          = tf.reshape(
             tf.gather(beam_scores, next_token, batch_dims = 1, axis = -1), [-1]
@@ -316,9 +363,16 @@ def _infer_beam_search(model,
             padding_mask    = padding_mask,
             finished    = finished,
             logits      = outputs.output,
-            scores      = scores
+            scores      = scores,
+            attention_weights   = attention_weights if not skip_attention else attn_weights
         )
 
+    skip_attention  = not return_attention and not return_last_attention
+    
+    temperature     = tf.cast(temperature, tf.float32)
+    length_power    = tf.cast(length_power, tf.float32)
+    length_temperature  = tf.cast(length_temperature, tf.float32)
+    
     batch_size  = 1
     if encoder_output is not None:
         batch_size = tf.shape(encoder_output)[0]
@@ -341,6 +395,9 @@ def _infer_beam_search(model,
     
     batch_idx_add   = tf.repeat(tf.range(batch_size), num_beams, axis = 0) * num_beams
     
+    shapes_invariant    = get_shape_invariant(
+        model, encoder_output = encoder_output, return_attention = return_attention
+    )
     outputs = tf.while_loop(
         cond    = cond,
         body    = body,
@@ -350,16 +407,36 @@ def _infer_beam_search(model,
             padding_mask    = padding_mask,
             finished    = tf.zeros((effective_batch_size,), dtype = tf.int32),
             logits      = tf.zeros((effective_batch_size, 1, tf.shape(encoder_output)[-1])),
-            scores      = tf.zeros((effective_batch_size, ))
+            scores      = tf.zeros((effective_batch_size, )),
+            attention_weights   = {
+                k : tf.zeros([d if d is not None else 1 for d in shape.shape])
+                for k, shape in shapes_invariant.attention_weights.items()
+            }
         ),
-        shape_invariants    = get_shape_invariant(),
+        shape_invariants    = shapes_invariant,
         maximum_iterations  = max_length
     )
     
+    scores  = outputs.scores
+    if length_power != 0:
+        lengths = tf.cast(tf.reshape(outputs.input_length, tf.shape(outputs.scores)), tf.float32)
+        scores  = outputs.scores / (lengths ** length_power)
+    
+    attn_weights = None
+    if not skip_attention:
+        attn_weights = {
+            k : tf.reshape(attn, [
+                batch_size, num_beams, tf.shape(attn)[1], tf.shape(attn)[2], tf.shape(attn)[3]
+            ])[:, :num_sentences]
+            for k, attn in outputs.attention_weights.items()
+        }
+    
     return TransformerInferenceOutput(
         tokens  = tf.reshape(outputs.tokens, [batch_size, num_beams, -1])[:, :num_sentences, 1:],
-        score   = tf.reshape(outputs.scores, [batch_size, num_beams])[:, :num_sentences],
+        lengths = tf.reshape(outputs.input_length, [batch_size, num_beams])[:, :num_sentences],
+        score   = tf.reshape(scores,         [batch_size, num_beams])[:, :num_sentences],
         output  = tf.reshape(outputs.logits, [batch_size, num_beams, tf.shape(outputs.logits)[1], -1])[:, :num_sentences],
+        attention_weights   = attn_weights
     )
 
 def _score_output(probs, indices):

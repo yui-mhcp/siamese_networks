@@ -10,17 +10,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tensorflow as tf
-
 from unitest import Test, assert_function, assert_equal
 
 def test_classifier(model_name, dataset):
     from models.classification import BaseClassifier
-    from models.model_utils import is_model_name
-    
-    if not is_model_name(model_name):
-        print("Model {} does not exist, skipping its consistency test !".format(model_name))
-        return
     
     if isinstance(dataset, str):
         from datasets import get_dataset
@@ -40,7 +33,7 @@ def test_classifier(model_name, dataset):
         image, label = data['image'], data['label']
         
         assert_function(model.predict, data['image'])
-        assert_equal(tf.cast(data['label'], tf.int32), lambda image: model.predict(image)[0][0], data['image'])
+        assert_equal(data['label'], lambda image: model.predict(image)[0][0], data['image'])
     
 @Test(sequential = True, model_dependant = 'mnist_classifier')
 def test_base_classifier():

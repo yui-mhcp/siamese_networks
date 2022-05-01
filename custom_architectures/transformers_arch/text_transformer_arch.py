@@ -57,7 +57,7 @@ HParamsTextTransformer  = HParamsTransformer(
 class TransformerTokenEmbedding(tf.keras.layers.Layer):
     def __init__(self, vocab_size, embedding_dim, max_input_length,
                  token_embedding = None, positional_embedding = None, name = 'embeddings', ** kwargs):
-        super().__init__(self, name = name)
+        super().__init__(name = name)
         
         self.hparams = HParamsTransformerTokenEmbedding.extract(kwargs)
         self.hparams = self.hparams(
@@ -125,11 +125,11 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
         return token_embedded * self.embedding_factor
     
     @timer
-    def embed_token_types(self, token_types):
+    def embed_token_types(self, text, token_types):
         token_type_embedded = 0.
         if self.token_type_embedding_layer is not None:
             if token_types is None:
-                token_types = tf.fill([tf.shape(text)[0], seq_len], value = 0)
+                token_types = tf.fill(tf.shape(text), value = 0)
             token_type_embedded = self.token_type_embedding_layer(token_types)
         return token_type_embedded
     
@@ -143,7 +143,8 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
                 position_ids = tf.range(seq_len)
 
             position_ids = tf.expand_dims(position_ids, axis = 0)
-            position_ids = position_ids + positional_offset
+            if positional_offset > 0:
+                position_ids = position_ids + positional_offset
         
         if debug:
             tf.print("Position ids :", position_ids)
@@ -179,7 +180,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
         token_embedded = self.embed_tokens(text)
         
         # Embed token types (if necessary)
-        token_type_embedded = self.embed_token_types(token_types)
+        token_type_embedded = self.embed_token_types(text, token_types)
         
         # Embed positions 
         pos_embedded = self.embed_positions(
@@ -195,6 +196,9 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
 
         return embeddings
 
+    def get_output_shape(self, inputs):
+        return tuple(inputs) + (self.embedding_dim, )
+    
     def get_config(self):
         config = super().get_config()
         return (self.hparams + config).get_config()
@@ -208,8 +212,6 @@ class TextTransformerBlock(TransformerBlock):
             vocab_size = vocab_size, embedding_dim = embedding_dim,
             max_input_length = max_input_length, ** kwargs
         )
-        
-        self.embedding_factor = tf.math.sqrt(float(embedding_dim) if self.hparams.scale_embedding else 1.)
     
     def _init_input_layers(self, token_embedding = None, positional_embedding = None,
                            ** kwargs):
@@ -292,7 +294,7 @@ class TextTransformerBlock(TransformerBlock):
         elif len(outputs) > 1:
             return (logits, ) + outputs[1:]
         return logits
-
+    
     @timer
     def infer(self, * args, ** kwargs):
         return infer(
@@ -302,6 +304,11 @@ class TextTransformerBlock(TransformerBlock):
             sos_token = self.hparams.sos_token,
             eos_token = self.hparams.eos_token,
             ** kwargs
+        )
+    
+    def get_output_shape(self, inputs, * args, ** kwargs):
+        return super().get_output_shape(
+            self.embeddings.get_output_shape(inputs), * args, ** kwargs
         )
     
 class TextTransformerEncoder(TextTransformerBlock):
