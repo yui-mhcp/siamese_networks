@@ -73,7 +73,6 @@ HParamsTransformer  = HParams(
     ** {k : (None if not k.startswith('return_') else _base_enc_dec_kwargs[k]) for k in _shared_config}
 )
 
-@timer
 def format_output(output,
                   state     = None,
                   logits    = None,
@@ -116,7 +115,6 @@ def format_output(output,
     
     return out[0] if not as_dict and len(out) == 1 else out
 
-@timer
 def build_mask(inputs,
                use_causal_attention,
                input_length     = None,
@@ -194,12 +192,16 @@ class TransformerLayer(tf.keras.layers.Layer):
         self.norm_training  = self.hparams.norm_training
         self.use_causal_attention   = self.hparams.use_causal_attention
         
-        self.attention  = MultiHeadAttention(** self.hparams.get_config(prefix = 'mha'), name = 'mha')
+        self.attention  = MultiHeadAttention(
+            ** self.hparams.get_config(prefix = 'mha'), name = 'mha'
+        )
         self.enc_attention  = MultiHeadAttention(
             ** self.hparams.get_config(prefix = 'enc_mha'), name = 'enc_mha'
         ) if self.hparams.use_encoder_attention else None
         
-        self.ffn = FeedForwardNetwork(self.hparams.ffn_dim, self.hparams.ffn_activation, embedding_dim)
+        self.ffn = FeedForwardNetwork(
+            self.hparams.ffn_dim, self.hparams.ffn_activation, embedding_dim
+        )
         
         self.norm   = tf.keras.layers.LayerNormalization(
             epsilon = self.hparams.epsilon
@@ -403,7 +405,7 @@ class TransformerBlock(tf.keras.Model):
         attention_weights   = {} if return_attention or return_last_attention else None
         hidden_states       = {} if return_hidden_states else None
 
-        if isinstance(inputs, (list, tuple)): inputs, seq_length = inputs
+        if isinstance(inputs, (list, tuple)): inputs, input_length = inputs
         
         if mask is None:
             mask = build_mask(
@@ -421,9 +423,12 @@ class TransformerBlock(tf.keras.Model):
                 initial_state   = initial_state[i] if initial_state is not None else None,
                 training    = training,
                 mask    = mask,
+                padding_mask    = padding_mask,
+                look_ahead_mask = look_ahead_mask,
                 enc_padding_mask    = enc_padding_mask,
                 return_attention    = True,
-                return_state        = True
+                return_state        = True,
+                ** kwargs
             )
             if return_state:
                 states  = states + (state, )

@@ -10,19 +10,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tensorflow as tf
+import os
+import logging
 
-class FasterEmbedding(tf.keras.layers.Embedding):
-    """Faster version of embedding."""
+def parse_docx(filename, ** kwargs):
+    """ Parse `.docx` files and return the list of paragraphs in the form {'text' : str} """
+    try:
+        from docx import Document
+    except ImportError as e:
+        logging.error('Exception from .docx parsing : {}'.format(e))
+        return []
+    
+    doc = Document(filename)
+    
+    return [{'text' : p.text} for p in doc.paragraphs]
+    return paragraphes
 
-    def __init__(self, * args, ** kwargs):
-        super().__init__(* args, ** kwargs)
-
-    def change_vocabulary(self, new_vocab, ** kwargs):
-        self.input_dim = len(new_vocab)
-        self.build((None, None))
-
-    def call(self, inputs):
-        inputs  = tf.cast(tf.expand_dims(inputs, -1), tf.int32)
-        outputs = tf.gather_nd(self.embeddings, inputs)
-        return outputs
+def save_first_page_as_image_docx(filename, image_name = 'first_page.jpg'):
+    raise NotImplementedError()

@@ -68,7 +68,9 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
                     'repeat_position']:
             setattr(self, key, self.hparams[key])
         
-        self.embedding_factor = tf.math.sqrt(float(embedding_dim) if self.hparams.scale_embedding else 1.)
+        self.embedding_factor = tf.math.sqrt(
+            float(embedding_dim) if self.hparams.scale_embedding else 1.
+        )
         
         # Set token embedding layer
         if token_embedding is None:

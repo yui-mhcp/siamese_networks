@@ -10,19 +10,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tensorflow as tf
+def parse_txt(filename, encoding = 'utf-8', paragraph_sep = '\n\n', ** kwargs):
+    with open(filename, 'r', encoding = encoding) as f:
+        text = f.read()
+    
+    return [{'text' : p} for p in text.split(paragraph_sep)]
 
-class FasterEmbedding(tf.keras.layers.Embedding):
-    """Faster version of embedding."""
-
-    def __init__(self, * args, ** kwargs):
-        super().__init__(* args, ** kwargs)
-
-    def change_vocabulary(self, new_vocab, ** kwargs):
-        self.input_dim = len(new_vocab)
-        self.build((None, None))
-
-    def call(self, inputs):
-        inputs  = tf.cast(tf.expand_dims(inputs, -1), tf.int32)
-        outputs = tf.gather_nd(self.embeddings, inputs)
-        return outputs
