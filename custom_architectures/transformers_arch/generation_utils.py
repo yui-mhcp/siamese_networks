@@ -41,10 +41,11 @@ TransformerInferenceState   = collections.namedtuple(
         "attention_weights"
     ]
 )
+
 def get_shape_invariant(model, encoder_output = None, return_attention = None, ** kwargs):
     logits_shape, attn_shapes = model.get_output_shape(
         (None, None),
-        encoder_output      = encoder_output.shape,
+        encoder_output      = encoder_output.shape if encoder_output is not None else None,
         return_attention    = return_attention,
         return_last_attention   = True
     )
@@ -57,7 +58,7 @@ def get_shape_invariant(model, encoder_output = None, return_attention = None, *
         input_length    = tf.TensorSpec(shape = (None, 1),          dtype = tf.int32),
         padding_mask    = tf.TensorSpec(shape = (None, 1, 1, None), dtype = tf.float32),
         finished        = tf.TensorSpec(shape = (None, ),           dtype = tf.int32),
-        logits          = tf.TensorSpec(shape = (logits_shape),     dtype = tf.float32),
+        logits          = tf.TensorSpec(shape = logits_shape,       dtype = tf.float32),
         scores          = tf.TensorSpec(shape = (None, ),           dtype = tf.float32),
         attention_weights   = attn_shapes
     )
@@ -110,6 +111,7 @@ def _infer(model,
            training  = False,
            use_cache = False,
            
+           batch_size   = None,
            sos_token    = None,
            eos_token    = None,
            max_length   = None,
@@ -150,8 +152,11 @@ def _infer(model,
         logits      = outputs.output
         
         next_token  = _select_next_token(
-            logits[:,-1,:], n = 1, previous = tokens, use_sampling = use_sampling
+            logits[:, -1, :], n = 1, previous = tokens, use_sampling = use_sampling
         )
+        
+        scores  = scores + tf.gather(logits[:, -1, :], next_token, batch_dims = 1) * tf.cast(1-finished, scores.dtype)
+        
         next_token  = tf.reshape(
             tf.cast(next_token, tokens.dtype), [batch_size, 1]
         )
@@ -159,7 +164,7 @@ def _infer(model,
         tokens  = tf.concat([tokens, next_token], axis = -1)
 
         finished    = tf.maximum(
-            finished, tf.cast(tf.math.equal(next_token[:,0], eos_token), tf.int32)
+            finished, tf.cast(tf.math.equal(next_token[:, 0], eos_token), tf.int32)
         )
         
         input_length += 1 - tf.expand_dims(finished, axis = 1)
@@ -180,17 +185,19 @@ def _infer(model,
     
     skip_attention = not return_attention and not return_last_attention
     
-    batch_size  = 1
     if encoder_output is not None:
         batch_size = tf.shape(encoder_output)[0]
     
     if tokens is None:
+        assert batch_size is not None, 'Provide either `encoder_output ` or `batch_size`'
         tokens          = tf.fill((batch_size, 1), sos_token)
         input_length    = tf.fill((batch_size, 1), 1)
     elif isinstance(tokens, (list, tuple)):
         tokens, input_length    = tokens
     
-    if batch_size == 1: batch_size = tf.shape(tokens)[0]
+    if batch_size is None: batch_size      = tf.shape(tokens)[0]
+    
+    assert batch_size is not None, 'Please provide either `tokens`, `encoder_output` or `batch_size`'
     
     if input_length is None:
         input_length    = tf.fill((batch_size,), tf.shape(tokens)[1])
@@ -209,7 +216,7 @@ def _infer(model,
             input_length    = input_length,
             padding_mask    = padding_mask,
             finished    = tf.zeros((batch_size,), dtype = tf.int32),
-            logits      = tf.zeros((batch_size, 1, tf.shape(encoder_output)[-1])),
+            logits      = tf.zeros((batch_size, 1, shapes_invariant.logits.shape[-1])),
             scores      = tf.zeros((batch_size, )),
             attention_weights   = {
                 k : tf.zeros([d if d is not None else 1 for d in shape.shape])
@@ -222,8 +229,8 @@ def _infer(model,
     
     return TransformerInferenceOutput(
         tokens  = outputs.tokens[..., 1:],
-        lengths = tf.reshape(outputs.input_length, [-1]),
-        score   = _score_output(outputs.logits, outputs.tokens[..., 1:]),
+        lengths = tf.reshape(outputs.input_length, [-1]) -1,
+        score   = outputs.scores,
         output  = outputs.logits,
         attention_weights   = outputs.attention_weights if not skip_attention else None
     )
@@ -246,6 +253,7 @@ def _infer_beam_search(model,
                        training  = False,
                        use_cache = False,
 
+                       batch_size   = None,
                        sos_token    = None,
                        eos_token    = None,
                        max_length   = None,
@@ -373,7 +381,6 @@ def _infer_beam_search(model,
     length_power    = tf.cast(length_power, tf.float32)
     length_temperature  = tf.cast(length_temperature, tf.float32)
     
-    batch_size  = 1
     if encoder_output is not None:
         batch_size = tf.shape(encoder_output)[0]
 
@@ -381,6 +388,8 @@ def _infer_beam_search(model,
         if enc_padding_mask is not None:
             enc_padding_mask  = tf.repeat(enc_padding_mask, num_beams, axis = 0)
     
+    assert batch_size is not None, 'Please provide either `tokens`, `encoder_output` or `batch_size`'
+
     effective_batch_size    = batch_size * num_beams
 
     if tokens is None:
@@ -406,7 +415,7 @@ def _infer_beam_search(model,
             input_length    = input_length,
             padding_mask    = padding_mask,
             finished    = tf.zeros((effective_batch_size,), dtype = tf.int32),
-            logits      = tf.zeros((effective_batch_size, 1, tf.shape(encoder_output)[-1])),
+            logits      = tf.zeros((effective_batch_size, 1, shapes_invariant.logits.shape[-1])),
             scores      = tf.zeros((effective_batch_size, )),
             attention_weights   = {
                 k : tf.zeros([d if d is not None else 1 for d in shape.shape])

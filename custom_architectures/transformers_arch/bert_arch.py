@@ -15,7 +15,7 @@
 import tensorflow as tf
 
 from custom_layers import get_activation
-from custom_architectures.current_blocks import _get_layer, _get_pooling_layer
+from custom_architectures.current_blocks import _get_layer
 from custom_architectures.transformers_arch.embedding_head import EmbeddingHead, HParamsEmbeddingHead
 from custom_architectures.transformers_arch.text_transformer_arch import TextTransformerEncoder, HParamsTextTransformerEncoder
 
@@ -75,6 +75,13 @@ class BaseBERT(TextTransformerEncoder):
             output, pooled_output, mask = mask, training = training
         )
 
+    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
+        from models.weights_converter import _transformer_patterns, name_based_partial_transfer_learning
+
+        return name_based_partial_transfer_learning(
+            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
+        )
+
     @classmethod
     def from_pretrained(cls,
                         pretrained_name,
@@ -82,8 +89,6 @@ class BaseBERT(TextTransformerEncoder):
                         pretrained      = None,
                         ** kwargs
                        ):
-        from models.weights_converter import partial_transfer_learning, print_vars
-        
         if pretrained is None:
             with tf.device('cpu') as d:
                 pretrained = transformers_bert(pretrained_name, pretrained_task)
@@ -111,10 +116,7 @@ class BaseBERT(TextTransformerEncoder):
         instance = cls(** config(** kwargs))
         instance._build()
         
-        weights = pretrained.get_weights()
-        if pretrained_task in ('lm', 'mlm'): weights.append(weights.pop(-5))
-        
-        partial_transfer_learning(instance, weights)
+        instance.transfer_weights(pretrained, pretrained_task = pretrained_task)
         
         return instance
 
@@ -188,7 +190,8 @@ class BertEmbedding(BaseBERT):
         super().__init__(
             vocab_size = vocab_size, embedding_dim = embedding_dim, output_dim = output_dim, ** kwargs
         )
-
+        if 'process_first_token' in kwargs:
+            kwargs['token_selector'] = True if kwargs['process_first_token'] else None
         self.embedding_head = EmbeddingHead(** self.hparams)
 
     def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
@@ -222,8 +225,8 @@ class DPR(BertEmbedding):
             
         kwargs.setdefault('output_dim', pretrained.config.projection_dim)
         kwargs.update({
-            'process_tokens'        : True,
-            'process_first_token'   : True,
+            'process_tokens'    : True,
+            'token_selector'    : 'first',
             'hidden_layer_type' : 'dense',
             'final_pooling'     : None,
             'use_final_dense'   : False
@@ -280,3 +283,4 @@ custom_objects  = {
 }
 
 _encoders   = {'Bert' : BertEmbedding, 'DPR' : DPR}
+_transformers   = _encoders

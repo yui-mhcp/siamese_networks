@@ -12,8 +12,9 @@
 
 """ TF 2.0 BART model, compatible with the `transformers`' model. """
 
-import numpy as np
 import tensorflow as tf
+
+from tqdm import tqdm
 
 from loggers import timer
 from custom_layers import FasterEmbedding, get_activation
@@ -35,22 +36,14 @@ HParamsBart     = HParamsTextTransformer(
 class BartEncoder(TextTransformerEncoder):
     default_params = HParamsBartEncoder
     
-    def transfer_weights(self, pretrained):
-        from models.weights_converter import partial_transfer_learning
-        offset, n_enc_layer_weights = 1, 16
-        
-        weights = pretrained.model.encoder.get_weights()
-        # Invert `key` and `value` weights for each MHA layer
-        for i in range(pretrained.config.encoder_layers):
-            weights[i * n_enc_layer_weights + offset], weights[i * n_enc_layer_weights + offset + 2] = (
-                weights[i * n_enc_layer_weights + offset + 2], weights[i * n_enc_layer_weights + offset]
-            )
-            weights[i * n_enc_layer_weights + offset + 1], weights[i * n_enc_layer_weights + offset + 3] = (
-                weights[i * n_enc_layer_weights + offset + 3], weights[i * n_enc_layer_weights + offset + 1]
-            )
-        weights = [pretrained.get_weights()[0], weights[0]] + weights[-2:] + weights[1:-2]
-        
-        partial_transfer_learning(self, weights)
+    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
+        from models.weights_converter import (
+            _transformer_patterns, name_based_partial_transfer_learning
+        )
+
+        return name_based_partial_transfer_learning(
+            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
+        )
 
     @classmethod
     def from_pretrained(cls,
@@ -100,7 +93,7 @@ class BartEmbedding(BartEncoder):
 class BartDecoder(TextTransformerDecoder):
     default_params = HParamsBartDecoder
     
-    def __init__(self, vocab_size, embedding_dim, token_embedding = None, name = None, ** kwargs):
+    def __init__(self, vocab_size, embedding_dim, token_embedding = None, ** kwargs):
         super().__init__(
             vocab_size = vocab_size, embedding_dim = embedding_dim,
             token_embedding = token_embedding, ** kwargs
@@ -116,46 +109,27 @@ class BartDecoder(TextTransformerDecoder):
         return self.vocab_size
     
     @timer
-    def compute_output(self, output, training = False, mask = None, apply_softmax = True,
-                       ** kwargs):
+    def compute_output(self, output, apply_softmax = True, ** kwargs):
         output = self.embeddings.linear(output) + self.final_bias
         if self.final_act_layer is not None and apply_softmax:
             output = self.final_act_layer(output)
         return output
     
-    def transfer_weights(self, pretrained):
-        from models.weights_converter import partial_transfer_learning, print_vars
-        offset, n_enc_layer_weights = 2, 16
-        
-        weights = pretrained.model.decoder.get_weights()
-        # Invert `key` and `value` weights for each MHA layer
-        offset, n_mha_weights, n_dec_layer_weights = 1, 10, 26
-        for i in range(pretrained.config.decoder_layers):
-            weights[i * n_dec_layer_weights + offset], weights[i * n_dec_layer_weights + offset + 2] = (
-                weights[i * n_dec_layer_weights + offset + 2], weights[i * n_dec_layer_weights + offset]
-            )
-            weights[i * n_dec_layer_weights + offset + 1], weights[i * n_dec_layer_weights + offset + 3] = (
-                weights[i * n_dec_layer_weights + offset + 3], weights[i * n_dec_layer_weights + offset + 1]
-            )
-            
-            weights[i * n_dec_layer_weights + n_mha_weights + offset], weights[i * n_dec_layer_weights + n_mha_weights + offset + 2] = (
-                weights[i * n_dec_layer_weights + n_mha_weights + offset + 2],
-                weights[i * n_dec_layer_weights + n_mha_weights + offset]
-            )
-            weights[i * n_dec_layer_weights + n_mha_weights + offset + 1], weights[i * n_dec_layer_weights + n_mha_weights + offset + 3] = (
-                weights[i * n_dec_layer_weights + n_mha_weights + offset + 3],
-                weights[i * n_dec_layer_weights + n_mha_weights + offset + 1]
-            )
-        # Add shared embeddings weights to the list
-        weights = [pretrained.get_weights()[0], weights[0]] + weights[-2:] + weights[1:-2] + [pretrained.get_weights()[-1]]
-        
-        partial_transfer_learning(self, weights)
+    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
+        from models.weights_converter import (
+            _transformer_patterns, name_based_partial_transfer_learning
+        )
 
+        return name_based_partial_transfer_learning(
+            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
+        )
+    
     @classmethod
     def from_pretrained(cls,
                         pretrained_name = 'facebook/bart-large',
                         pretrained_task = 'generation',
                         pretrained      = None,
+                        tqdm    = lambda x: x,
                         ** kwargs
                        ):
         if pretrained is None:
@@ -182,7 +156,7 @@ class BartDecoder(TextTransformerDecoder):
         instance = cls(** config(** kwargs))
         instance._build()
         
-        instance.transfer_weights(pretrained)
+        instance.transfer_weights(pretrained, tqdm = tqdm)
         
         return instance
 
@@ -193,10 +167,15 @@ class Bart(TextTransformer):
     
     def __init__(self, vocab_size, embedding_dim, max_input_length,
                  ** kwargs):
-        shared_embedding = FasterEmbedding(vocab_size, embedding_dim, name = "token_embedding")
+        shared_embedding = FasterEmbedding(
+            vocab_size, embedding_dim, name = "token_embedding"
+        )
         super().__init__(
-            vocab_size = vocab_size, embedding_dim = embedding_dim, max_input_length = max_input_length,
-            shared_layers = {'token_embedding' : shared_embedding}, ** kwargs
+            vocab_size      = vocab_size,
+            embedding_dim   = embedding_dim,
+            max_input_length    = max_input_length,
+            shared_layers   = {'token_embedding' : shared_embedding},
+            ** kwargs
         )
 
     @classmethod
@@ -204,6 +183,7 @@ class Bart(TextTransformer):
                         pretrained_name = 'facebook/bart-large',
                         pretrained_task = 'generation', 
                         pretrained      = None,
+                        tqdm    = tqdm,
                         ** kwargs
                        ):
         if pretrained is None:
@@ -235,8 +215,8 @@ class Bart(TextTransformer):
         instance = cls(** config(** kwargs))
         instance._build()
         
-        instance.encoder.transfer_weights(pretrained)
-        instance.decoder.transfer_weights(pretrained)
+        instance.encoder.transfer_weights(pretrained, tqdm = tqdm)
+        instance.decoder.transfer_weights(pretrained, tqdm = tqdm)
         
         return instance
 
@@ -268,3 +248,4 @@ custom_objects  = {
 
 _encoders   = {'Bart' : BartEmbedding}
 _decoders   = {'Bart' : BartDecoder}
+_transformers   = {'Bart' : Bart}

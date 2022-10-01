@@ -10,6 +10,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+""" Tensorflow 2.x implementation of the main Transformers' blocks """
+
 import logging
 import collections
 import tensorflow as tf
@@ -70,9 +72,13 @@ HParamsTransformerDecoder   = HParamsTransformerBlock(
 HParamsTransformer  = HParams(
     ** HParamsTransformerEncoder.get_config(add_prefix = 'encoder'),
     ** HParamsTransformerDecoder.get_config(add_prefix = 'decoder'),
-    ** {k : (None if not k.startswith('return_') else _base_enc_dec_kwargs[k]) for k in _shared_config}
+    ** {
+        k : (None if not k.startswith('return_') else _base_enc_dec_kwargs[k])
+        for k in _shared_config
+    }
 )
 
+@timer
 def format_output(output,
                   state     = None,
                   logits    = None,
@@ -115,6 +121,7 @@ def format_output(output,
     
     return out[0] if not as_dict and len(out) == 1 else out
 
+@timer
 def build_mask(inputs,
                use_causal_attention,
                input_length     = None,
@@ -147,6 +154,14 @@ def build_mask(inputs,
 
 class FeedForwardNetwork(tf.keras.Model):
     def __init__(self, ffn_dim, ffn_activation, embedding_dim, name = 'ffn'):
+        """
+            Simple 2-`Dense` sequential network with an activation function between the 2 layers.
+            
+            Arguments :
+                - ffn_dim   : the 1st layer's number of units
+                - ffn_activation    : the activation function between the 2 layers
+                - embedding_dim     : the Transformers' depth (the number of units for the 2nd layer)
+        """
         super().__init__(name = name)
         
         self.ffn_dim    = ffn_dim
@@ -157,6 +172,7 @@ class FeedForwardNetwork(tf.keras.Model):
         self.act        = get_activation(ffn_activation)
         self.dense_2    = tf.keras.layers.Dense(embedding_dim, name = 'dense_2')
     
+    @timer(name = 'FFN call')
     def call(self, inputs, training = False):
         x = self.dense_1(inputs)
         if self.act is not None: x = self.act(x)
@@ -175,6 +191,35 @@ class FeedForwardNetwork(tf.keras.Model):
 
 class TransformerLayer(tf.keras.layers.Layer):
     def __init__(self, embedding_dim, name = None, ** kwargs):
+        """
+            A fully customizable Transformer layer.
+            It handles:
+                - self-attention    : when Q = K = V
+                    The 1st MHA is by default a self-attention layer
+                    - In Encoder-only       : there is only 1 self-MHA
+                    - In Encoder-Decoder    : there is 1 self-MHA followed by a causal-MHA
+                - causal attention  : when using the masking operator
+                    Set `use_causal_attention = True` in the constructor
+                    The 2nd attention (if `use_encoder_attention = True`) is by default causal
+                - Encoder-Decoder mode  : uses 2 MHA (a self-MHA followed by a causal-MHA)
+                    Set `use_encoder_attention = True` in the constructor.
+                    Note that the 2nd MHA is not a self-MHA as K and V are the `encoder_output` call argument
+            
+            See the `HParamsTransformerLayer` class for an exhaustive list of configuration. 
+                Those starting with `ffn_` are related to the feed-forward network
+                Those starting with `mha_` are related to the 1st MHA
+                Those starting with `enc_mha_` are related to the 2nd MHA (ignored if `use_encoder_attention = False`)
+                
+                - normalize : where to apply the `LayerNormalization`
+                    - before    : directly on the layer's input
+                    - middle    : just before the FFN call but it does not normalize the FFN's residual !
+                    `ffn_out = mha_out + norm(ffn(mha_out))` (it is used by `GPT-2` models)
+                    - after     : default case where the normalization is applied on the FFN's output
+                - use_causal_attention  : whether to use the masking operator or not (on the 1st MHA)
+                - use_encoder_attention : whether to use 1 or 2 MHA
+            
+            Note that the `epsilon` and `norm_training` are propagated to the MHA
+        """
         super().__init__(name = name)
         
         self.hparams    = HParamsTransformerLayer.extract(kwargs)
@@ -200,11 +245,11 @@ class TransformerLayer(tf.keras.layers.Layer):
         ) if self.hparams.use_encoder_attention else None
         
         self.ffn = FeedForwardNetwork(
-            self.hparams.ffn_dim, self.hparams.ffn_activation, embedding_dim
+            self.hparams.ffn_dim, self.hparams.ffn_activation, embedding_dim, name = 'ffn'
         )
         
         self.norm   = tf.keras.layers.LayerNormalization(
-            epsilon = self.hparams.epsilon
+            epsilon = self.hparams.epsilon, name = 'norm'
         ) if self.hparams.normalize else None
         self.dropout    = tf.keras.layers.Dropout(self.hparams.drop_rate)
     
@@ -213,11 +258,14 @@ class TransformerLayer(tf.keras.layers.Layer):
              inputs,
              input_length   = None,
              encoder_output = None,
+             
              initial_state  = None,
+             
              mask       = None,
              padding_mask   = None,
              look_ahead_mask    = None,
              enc_padding_mask   = None,
+             
              training   = False,
              return_state       = False,
              return_attention   = True,
@@ -225,22 +273,23 @@ class TransformerLayer(tf.keras.layers.Layer):
             ):
         """
             Arguments :
-                - encoder_output    : encoder output with shape [batch_size, seq_len_in, encoder_embedding_dim]
-                - target            : decoder input with shape [batch_size, seq_len_out, embedding_dim]
-                - enc_padding_mask  : mask for encoder input padding (passed to the 2nd attention block)
-                - look_ahead_mask   : mask for decoder_input look_ahead (+ padding (optionnal))
+                - inputs    : the layers' input (the query) with shape [B, q_len, embedding_dim]
+                - input_length  : the inputs' sequence lengths (to build the padding mask)
+                - encoder_output    : encoder output with shape [B, in_seq_len, encoder_embedding_dim]
+                
+                - initial_state     : state to use (typically the previous iteration state)
+                
+                - mask  : the mask to use for the 1st MHA
+                - padding_mask  : the padding mask for the 1st MHA          [B, 1, seq_len, seq_len]
+                - look_ahead_mask   : the causal mask for the 1st MHA       [B, 1, 1, seq_len]
+                - enc_padding_mask  : the padding mask used for the 2nd MHA [B, 1, 1, in_seq_len]
+                
                 - training  : whether it is training / inference phase
+                - return_state      : whether to return the internal state or not
                 - return_attention  : whether to return attention weights or not
             Return : output if not return_attention else [output, attention]
                 - output    : the layer output with same shape as input
                 - attention_weights : self-attention weights for each head of the MHA
-            
-            Pipeline : 
-            1) `decoder_input` is passed in the 1st MHA layer (as query, key and value) with the look_ahead_mask : self-attention
-            2) Normalization of the sum of attention_output (1st block) + decoder_inputs
-            3) 2nd attention block with `encoder_output` as key and value, and `normalized attention output` as query (with the `padding_mask`) : encoder attention
-            4) Pass the output of the 2nd block to the FFN network (2 Dense layers)
-            5) Normalize the sum of `enc_attn_output` and `ffn_output`
         """
         if self.normalize == 'before':
             inputs = self.norm(inputs, training = training and self.norm_training)
@@ -251,7 +300,7 @@ class TransformerLayer(tf.keras.layers.Layer):
                 look_ahead_mask = look_ahead_mask, padding_mask = padding_mask,
                 initial_state = initial_state
             )
-        
+
         attn_outputs    = self.attention(
             inputs, inputs, inputs, mask = mask, training = training, initial_state = initial_state,
             return_attention = return_attention, return_state = return_state, normalize_kv = True
@@ -332,6 +381,7 @@ class TransformerBlock(tf.keras.Model):
     ]
     
     def __init__(self, embedding_dim, num_layers, name = None, ** kwargs):
+        """ Simply a list of `num_layers` TransformerLayer applied sequentially """
         super().__init__(name = name)
         self.hparams    = self.default_params.extract(kwargs)
         self.hparams    = self.hparams(embedding_dim = embedding_dim, num_layers = num_layers)
@@ -342,7 +392,7 @@ class TransformerBlock(tf.keras.Model):
         self._init_input_layers(** kwargs)
         
         self._layers = [
-            TransformerLayer(name = 'layer_{}'.format(i+1), ** self.hparams)
+            TransformerLayer(name = 'layer_{}'.format(i), ** self.hparams)
             for i in range(self.hparams.num_layers)
         ]
     
@@ -366,17 +416,23 @@ class TransformerBlock(tf.keras.Model):
     def output_last_dim(self):
         return self.embedding_dim
 
-    @timer
+    @timer(name = 'Transformer block call')
     def call(self,
              inputs,
              input_length   = None,
              encoder_output = None,
              initial_state  = None,
+             
              mask       = None,
              padding_mask   = None,
              look_ahead_mask    = None,
              enc_padding_mask   = None,
+             
              training   = False,
+             
+             first_layer_idx    = -1,
+             last_layer_idx     = -1,
+             
              return_state       = None,
              return_attention   = None,
              return_last_attention  = None,
@@ -385,9 +441,9 @@ class TransformerBlock(tf.keras.Model):
              as_dict    = False,
              ** kwargs
             ):
-        """
+        """ See the TransformerLayer
             Arguments :
-                - inputs    : encoder inputs with shape [batch_size, seq_len, embedding_dim], embedded inputs
+                - inputs    : block inputs with shape [batch_size, seq_len, embedding_dim], embedded inputs
                 - mask      : attention mask (padding mask based in inputs)
                 - training  : whether it is training / inference phase
                 - return_attention  : whether to return attention weights or not
@@ -396,6 +452,9 @@ class TransformerBlock(tf.keras.Model):
                 - output    : the layer output with same shape as input
                 - attention_weights : dict self-attention weights for each head of the MHA of each layer
         """
+        if first_layer_idx == -1:   first_layer_idx = 0
+        if last_layer_idx == -1:    last_layer_idx = len(self._layers)
+        
         if return_state is None:            return_state = self.return_state
         if return_attention is None:        return_attention = self.return_attention
         if return_hidden_states is None:    return_hidden_states = self.return_hidden_states
@@ -415,7 +474,7 @@ class TransformerBlock(tf.keras.Model):
             )
         
         output = inputs
-        for i, layer in enumerate(self._layers):
+        for i, layer in enumerate(self._layers[first_layer_idx : last_layer_idx], start = first_layer_idx):
             output, state, attn_weights = layer(
                 output,
                 input_length    = input_length,
@@ -487,7 +546,7 @@ class TransformerBlock(tf.keras.Model):
                 states_shape  = states_shape + (state, )
             
             if return_attention or (return_last_attention == True and i == len(self._layers) - 1):
-                if not isinstance(attn_weights, tuple):
+                if len(attn_weights) != 2:
                     attention_weights_shape['attn_{}'.format(layer.name)] = attn_weights
                 else:
                     attention_weights_shape['attn_{}'.format(layer.name)] = attn_weights[0]
@@ -532,9 +591,29 @@ class Transformer(tf.keras.Model):
         'return_state', 'return_attention', 'return_hidden_states', 'return_mask'
     ]
     
-    def __init__(self, name = None, shared_layers = {}, ** kwargs):
+    def __init__(self,
+                 name = None,
+                 shared_layers = {},
+                 encoder_wrapper = None,
+                 encoder_wrapper_params = None,
+                 decoder_wrapper = None,
+                 decoder_wrapper_params = None,
+                 ** kwargs
+                ):
         super().__init__(name = name)
-        self.hparams = self.default_params.extract(kwargs)
+        default_params  = self.default_params
+        if encoder_wrapper is None: encoder_wrapper = lambda x, ** kwargs: x
+        elif encoder_wrapper_params is not None:
+            default_params = default_params(
+                ** encoder_wrapper_params.get_config(add_prefix = 'encoder')
+            )
+        if decoder_wrapper is None: decoder_wrapper = lambda x, ** kwargs: x
+        elif decoder_wrapper_params is not None:
+            default_params = default_params(
+                ** decoder_wrapper_params.get_config(add_prefix = 'decoder')
+            )
+        
+        self.hparams = default_params.extract(kwargs)
         # Allow to have different embedding dim for encoder and decoder
         _shared = {}
         for k in self._shared_keys:
@@ -548,19 +627,19 @@ class Transformer(tf.keras.Model):
         for config in self._attr_to_set:
             setattr(self, config, self.hparams[config])
         
-        self.encoder    = self.encoder_class(
+        self.encoder    = encoder_wrapper(self.encoder_class(
             ** self.hparams.get_config(prefix = 'encoder'), ** shared_layers, name = 'encoder'
-        )
+        ), ** self.hparams.get_config(prefix = 'encoder'))
         
-        self.decoder    = self.decoder_class(
+        self.decoder    = decoder_wrapper(self.decoder_class(
             ** self.hparams.get_config(prefix = 'decoder'), ** shared_layers, name = 'decoder'
-        )
+        ), ** self.hparams.get_config(prefix = 'decoder'))
     
     def _build(self):
         if hasattr(self, 'dummy_inputs'):
             self(self.dummy_inputs, training = False)
 
-    @timer
+    @timer(name = 'Transformer call')
     def call(self,
              inputs,
              input_length   = None,

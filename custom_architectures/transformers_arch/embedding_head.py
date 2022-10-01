@@ -10,17 +10,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import tensorflow as tf
 
+from utils import get_enum_item
 from hparams.hparams import HParams
 from custom_layers import get_activation
 from custom_architectures.current_blocks import _get_layer, _get_pooling_layer
 
+class TokenSelector(enum.IntEnum):
+    NONE    = 0
+    FIRST   = 1
+    LAST    = 2
+    MIN     = 3
+    MAX     = 4
+    
 HParamsEmbeddingHead   = HParams(
     output_dim = -1,
-    process_first_token = False,
+    token_selector  = TokenSelector.NONE,
     
     hidden_dim  = 0,
+    hidden_name = 'hidden_layer',
     hidden_activation   = None,
     hidden_drop_rate    = 0.1,
     hidden_layer_type   = 'bi_lstm',
@@ -28,38 +38,48 @@ HParamsEmbeddingHead   = HParams(
     
     final_pooling   = None,
     use_final_dense = True,
-    final_name      = 'output_layer',
-    final_activation    = None,
-    normalize   = False     # for embedding l2-normalization support (siamese networks)
+    output_bias      = True,
+    output_name      = 'output_layer',
+    output_activation    = None,
+    output_normalize    = False # for l2-normalization
 )
 
 class EmbeddingHead(tf.keras.layers.Layer):
-    def __init__(self, output_dim, name = None, ** kwargs):
+    def __init__(self, output_dim, name = 'output', ** kwargs):
         super().__init__(name = name)
         kwargs.update({'output_dim' : output_dim})
         self.hparams = HParamsEmbeddingHead.extract(kwargs)
 
+        self.token_selector = get_enum_item(self.hparams.token_selector, TokenSelector)
+        
         # Layers are applied in this order (initialized only if required)
         self.hidden_layer   = None
         self.hidden_act_layer   = None
         self.hidden_drop_layer  = None
+        
         self.final_pooling  = None
         self.concat_layer   = None
+        
         self.final_dense    = None
         self.final_act_layer    = None
+        self.final_norm_layer   = None
         
         if not self.hparams.use_final_dense or self.hparams.hidden_dim > 0:
             if self.hparams.use_final_dense:
                 units   = self.hparams.hidden_dim
-                name    = 'hidden_layer'
+                name    = self.hparams.hidden_name
                 act     = self.hparams.hidden_activation
                 drop    = self.hparams.hidden_drop_rate
             else:
-                units, name, act, drop = output_dim, self.hparams.final_name, self.hparams.final_activation, 0.
+                units   = self.hparams.output_dim
+                name    = self.hparams.output_name
+                act     = self.hparams.output_activation
+                drop    = 0.
 
             if units > 0:
                 self.hidden_layer = _get_layer(
-                    self.hparams.hidden_layer_type, units, name = name, ** self.hparams.hidden_layer_kwargs
+                    self.hparams.hidden_layer_type, units, name = name,
+                    ** self.hparams.hidden_layer_kwargs
                 )
                 self.hidden_act_layer   = get_activation(act)
                 if drop > 0: self.hidden_drop_layer = tf.keras.layers.Dropout(drop)
@@ -72,14 +92,37 @@ class EmbeddingHead(tf.keras.layers.Layer):
                 self.concat_layer   = tf.keras.layers.Concatenate(axis = -1)
         
         if self.hparams.use_final_dense and output_dim > 0:
-            self.final_dense    = tf.keras.layers.Dense(output_dim, name = self.hparams.final_name)
-            self.final_act_layer    = get_activation(self.hparams.final_activation)
-
-    def call(self, inputs, mask = None, training = False):
-        output = inputs if not self.hparams.process_first_token else inputs[:, 0, :]
+            self.final_dense    = tf.keras.layers.Dense(
+                output_dim, use_bias = self.hparams.output_bias, name = self.hparams.output_name
+            )
+            self.final_act_layer    = get_activation(self.hparams.output_activation)
         
-        if mask is not None and not self.hparams.process_first_token:
-            mask = tf.cast(1. - tf.reshape(mask, [tf.shape(output)[0], tf.shape(output)[1]]), tf.bool)
+        if self.hparams.output_normalize:
+            self.final_norm_layer = tf.keras.layers.Lambda(
+                lambda x: tf.math.l2_normalize(x, axis = -1)
+            )
+
+    def select_token(self, inputs, text = None):
+        if self.token_selector == TokenSelector.NONE:
+            return inputs
+        elif self.token_selector == TokenSelector.FIRST:
+            return inputs[:, 0]
+        elif self.token_selector == TokenSelector.LAST:
+            return inputs[:, -1]
+        elif self.token_selector == TokenSelector.MIN:
+            assert len(tf.shape(text)) == 2, 'Invalid tokens shape : {}'.format(tf.shape(text))
+            return tf.gather(inputs, tf.argmin(text, axis = -1))
+        elif self.token_selector == TokenSelector.MAX:
+            assert len(tf.shape(text)) == 2, 'Invalid tokens shape : {}'.format(tf.shape(text))
+            return tf.gather(inputs, tf.argmax(text, axis = -1), batch_dims = 1)
+
+    def call(self, inputs, mask = None, training = False, text = None, ** kwargs):
+        output = self.select_token(inputs, text = text)
+        
+        if mask is not None and self.token_selector > 0:
+            mask = tf.cast(
+                1. - tf.reshape(mask, [tf.shape(output)[0], tf.shape(output)[1]]), tf.bool
+            )
         
         if self.hidden_layer is not None:
             if self.hparams.hidden_layer_type != 'dense':
@@ -107,7 +150,7 @@ class EmbeddingHead(tf.keras.layers.Layer):
         if self.final_dense is not None: output = self.final_dense(output)
         if self.final_act_layer is not None: output = self.final_act_layer(output)
         
-        if self.hparams.normalize: output = tf.math.l2_normalize(output, axis = -1)
+        if self.final_norm_layer is not None: output = self.final_norm_layer(output)
         
         return output
     

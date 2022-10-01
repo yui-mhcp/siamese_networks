@@ -10,11 +10,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from models.siamese.clip import CLIP
 from models.siamese.audio_siamese import AudioSiamese
 from models.siamese.image_siamese import ImageSiamese
 from models.siamese.text_siamese import TextSiamese
 
 _models = {
+    'CLIP'  : CLIP,
     'AudioSiamese'  : AudioSiamese,
     'ImageSiamese'  : ImageSiamese,
     'TextSiamese'   : TextSiamese

@@ -13,13 +13,16 @@
 import os
 import glob
 
+from utils.generic_utils import to_lower_keys
+
 def __load():
     for module_name in glob.glob(os.path.join('custom_architectures', 'transformers_arch/*.py')):
         if os.path.basename(module_name) in ['__init__.py']: continue
         module_name = module_name.replace(os.path.sep, '.')[:-3]
 
         module = __import__(
-            module_name, fromlist = ['custom_objects', 'custom_functions', '_encoders', '_decoders']
+            module_name,
+            fromlist = ['custom_objects', 'custom_functions', '_encoders', '_decoders', '_transformers']
         )
         if hasattr(module, 'custom_objects'):
             custom_objects.update(module.custom_objects)
@@ -29,20 +32,50 @@ def __load():
             _encoders.update(module._encoders)
         if hasattr(module, '_decoders'):
             _decoders.update(module._decoders)
+        if hasattr(module, '_transformers'):
+            _transformers.update(module._transformers)
+        else:
+            if hasattr(module, '_encoders'):
+                _transformers.update(module._encoders)
+            if hasattr(module, '_decoders'):
+                _transformers.update(module._decoders)
+
+def _get_pretrained(pretrained_name,
+                    _possible_classes,
+                    _class_type = 'transformer',
+                    class_name  = None,
+                    wrapper = None,
+                    ** kwargs
+                   ):
+    if wrapper:
+        return wrapper.from_pretrained(
+            pretrained_name = pretrained_name, class_name = class_name, ** kwargs
+        )
+    if not class_name: class_name = pretrained_name
+    class_name = class_name.lower()
+    _possible_classes   = to_lower_keys(_possible_classes)
+    
+    if class_name in _possible_classes:
+        return _possible_classes[class_name].from_pretrained(
+            pretrained_name = pretrained_name, ** kwargs
+        )
+    
+    for model_name, model_class in _possible_classes.items():
+        if model_name in class_name:
+            return model_class.from_pretrained(pretrained_name = pretrained_name, ** kwargs)
+    
+    raise ValueError('Unknown {} class for pretrained model {}'.format(
+        _class_type, pretrained_name
+    ))
 
 def get_pretrained_transformer_encoder(pretrained_name, ** kwargs):
-    for name, encoder_class in _encoders.items():
-        if name.lower() in pretrained_name:
-            return encoder_class.from_pretrained(pretrained_name = pretrained_name, ** kwargs)
-    
-    raise ValueError("Unknown pretrained class for encoder name {} !".format(pretrained_name))
+    return _get_pretrained(pretrained_name, _encoders, 'encoder', ** kwargs)
 
 def get_pretrained_transformer_decoder(pretrained_name, ** kwargs):
-    for name, decoder_class in _decoders.items():
-        if name.lower() in pretrained_name:
-            return decoder_class.from_pretrained(pretrained_name = pretrained_name, ** kwargs)
-    
-    raise ValueError("Unknown pretrained class for decoder name {} !".format(pretrained_name))
+    return _get_pretrained(pretrained_name, _decoders, 'decoder', ** kwargs)
+
+def get_pretrained_transformer(pretrained_name, ** kwargs):
+    return _get_pretrained(pretrained_name, _transformers, 'transformers', ** kwargs)
 
         
 custom_objects = {}
@@ -50,6 +83,7 @@ custom_functions = {}
 
 _encoders   = {}
 _decoders   = {}
+_transformers   = {}
 
 __load()
 

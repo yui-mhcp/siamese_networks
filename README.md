@@ -3,28 +3,43 @@
 ## Project structure
 
 ```bash
-├── custom_architectures/   : custom architectures
-├── custom_layers/          : custom layers
-├── custom_train_objects/   : custom objects for training
-│   ├── callbacks/          : custom callbacks
-│   ├── generators/         : custom data generators
-│   ├── losses/             : custom losses
-│   ├── optimizers/         : custom optimizers / lr schedulers
-├── datasets/               : utilities for dataset loading / processing
-│   ├── custom_datasets/    : where to save custom datasets processing
-├── hparams/                : utility class to define modulable hyper-parameters
-├── loggers/                : some logging utilities
-├── models/                 : main `BaseModel` subclasses directory
-│   ├── siamese/            : directory for `SiameseNetwork` subclasses
-├── pretrained_models/      : saving directory for pretrained models
-├── unitest/                : custom unitest framework to test models' consistency
-└── utils/                  : utilities for data processing
-
+├── custom_architectures
+│   ├── transformers_arch
+│   │   ├── clip_text_encoder_arch.py   : CLIP text encoder architecture (GPT-2 like)
+│   │   └── visual_transformer_arch.py  : CLIP image encoder architecture
+│   ├── clip_arch.py
+│   └── modified_resnet_arch.py     : CLIP image encoder architecture (ResNet based)
+├── custom_layers
+├── custom_train_objects
+│   ├── generators
+│   │   ├── audio_siamese_generator.py  : siamese generator for audio data
+│   │   ├── image_siamese_generator.py  : siamese generator for image data
+│   │   └── siamese_generator.py        : abstract siamese data generator
+├── datasets
+├── hparams
+├── loggers
+├── models
+│   ├── siamese
+│   │   ├── audio_siamese.py    : audio siamese class (audio to audio comparison)
+│   │   ├── base_comparator.py  : abstract Comparator class
+│   │   ├── clip.py             : CLIP main class (experimental) (text to image comparison)
+│   │   ├── image_siamese.py    : image siamese class (image to image comparison)
+│   │   ├── siamese_network.py  : abstract Siamese class
+│   │   └── text_siamese.py     : text siamese class (text to text comparison)
+├── pretrained_models
+├── unitest
+├── utils
+├── example_audio_siamese.ipynb
+├── example_clip.ipynb
+├── example_fashion_mnist_siamese.ipynb
+├── example_fashion_mnist_siamese_2.ipynb
+├── example_mnist_siamese.ipynb
+└── example_text_siamese.ipynb
 ```
 
-See [my data_processing repo](https://github.com/yui-mhcp/data_processing) for more information on the `utils` module and `data processing` features.
+Check [the main project](https://github.com/yui-mhcp/base_dl_project) for more information about the unextended modules / structure / main classes. 
 
-See [my base project](https://github.com/yui-mhcp/base_dl_project) for more information on the `BaseModel` class, supported datasets, project extension, ...
+Note : CLIP is a newly added model and is still experimental. It is properly working in the notebook but I have not tested to train it yet. 
 
 ## Available models
 
@@ -38,6 +53,8 @@ See [my base project](https://github.com/yui-mhcp/base_dl_project) for more info
 
 
 Models must be unzipped in the `pretrained_models/` directory !
+
+Note : for [CLIP](https://openai.com/blog/clip/) models, weights are automatically downloaded from  [the original project](https://github.com/openai/clip). They require `pytorch` to be installed but you do not need a working GPU installation. 
 
 ## Installation and usage
 
@@ -55,10 +72,16 @@ Models must be unzipped in the `pretrained_models/` directory !
 - [ ] Implement the `similarity matrix` evaluation procedure
 - [ ] Implement the `clustering` evaluation procedure
 - [x] Add the `AudioSiamese` model
+- [ ] Make the `Siamese` class a sublcass of `Comparator` (as siamese networks are a special case of Comparator networks where the 2 encoders refer to the same model)
 - [x] Add more configuration for `AudioSiamese `audio processing
 - [x] Improve the image loading support
 - [x] Improve siamese datasets creation performances (quite slow if you use many combinations / id but more efficient for many different ids with *small* items (typically around 100 / id))
-- [ ] Implement more comparators (text / face / ...)
+- [ ] Implement more comparators :
+    - [x] Audio - Audio comparator (`AudioSiamese`)
+    - [x] Image - Image comparator (`ImageSiamese`)
+    - [x] Text - Text comparator (`TextSiamese`)
+    - [x] Text - Image comparator ([CLIP](https://openai.com/blog/clip/))
+    - [ ] Text - Video comparator
 
 ## What is Siamese Network ?
 
@@ -82,6 +105,16 @@ However, I prefer this approach because it allows some interesting features :
 - It allows to use the model as a classification model more easily than the other method
 
 \* Note : after the `shared encoder` model, a `L2-normalization layer` seems to be really efficient to stabilize the model and improve performances
+
+### Difference between a `Siamese` network and a `Comparator` network
+
+A `Comparator` network is the general `Siamese` case where both encoders are different. Therefore, `Siamese Networks` are a special case of `Comparator` networks where both models are the same and share their weights. 
+
+Example : 
+- [Dense Passage Retrieval (DPR)](https://arxiv.org/abs/2004.04906) is a comparator network even if its 2 encoders are the same architecture, simply because their weights are different. 
+- [CLIP](https://openai.com/blog/clip/) is by design a comparator network as its 2 inputs are different (image and text) so the 2 encoders are different.
+- `AudioSiamese` is a siamese network because it only has 1 encoder that encodes the 2 input audios. 
+    
 
 ### Advantages compared to a classical classifier
 
@@ -236,3 +269,4 @@ Tutorials :
 
 Github project : 
 - [voicemap project](https://github.com/oscarknagg/voicemap) : github associated with the 2nd tutorial and my 1st inspiration for the `AudioSiamese` model
+- [OpenAI's CLIP](https://github.com/openai/clip) : the official `CLIP` implementation in pytorch. 
