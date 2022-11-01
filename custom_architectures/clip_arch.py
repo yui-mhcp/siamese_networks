@@ -75,7 +75,11 @@ def CLIP(pretrained_name, pretrained = None, normalize = True,
         input_dim   = visual_encoder.input_shape[1]
     elif 'vit' in pretrained_name.lower():
         visual_encoder  = get_pretrained_transformer_encoder(
-            pretrained_name = pretrained_name, pretrained = state_dict, class_name = 'VisualTransformer', name = 'image_encoder', ** kwargs
+            pretrained_name = pretrained_name,
+            pretrained  = state_dict,
+            class_name  = 'VisualTransformer',
+            name = 'image_encoder',
+            ** kwargs
         )
         input_dim   = visual_encoder.input_dim
 

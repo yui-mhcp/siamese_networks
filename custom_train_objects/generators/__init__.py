@@ -10,5 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from custom_train_objects.generators.audio_siamese_generator import AudioSiameseGenerator
+from custom_train_objects.generators.audio_file_generator import (
+    AudioGrouperGenerator, AudioSiameseGenerator
+)
 from custom_train_objects.generators.image_siamese_generator import ImageSiameseGenerator

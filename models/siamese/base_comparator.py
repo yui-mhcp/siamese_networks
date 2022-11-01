@@ -23,7 +23,8 @@ from loggers import timer
 from custom_layers import SimilarityLayer
 from models.interfaces import BaseModel
 from utils.distance import distance, KNN
-from utils.embeddings import load_embedding, embed_dataset
+from utils.thread_utils import Pipeline
+from utils.embeddings import _embedding_filename, _default_embedding_ext, load_embedding
 from utils import plot_embedding, pad_batch
 
 logger  = logging.getLogger(__name__)
@@ -463,13 +464,18 @@ class BaseComparator(BaseModel):
         """
         return 1. - self.pred_similarity_matrix(x, y, decoder, ** kwargs)
     
-    def embed_dataset(self, directory, dataset, ** kwargs):
-        """ Call the `embed_dataset` function with `self.embed` as embedding function """
-        return embed_dataset(
-            directory   = directory, 
-            dataset     = dataset, 
-            embed_fn    = self.embed, 
-            embedding_dim   = self.embedding_dim, 
+    def embed_dataset(self, directory, dataset, use_encoder_a, embedding_name = None, ** kwargs):
+        """
+            Calls `self.predict` and save the result to `{directory}/embeddings/{embedding_name}` (`embedding_name = self.nom` by default)
+        """
+        if not directory.endswith('embeddings'): directory = os.path.join(directory, 'embeddings')
+        
+        return self.predict(
+            dataset,
+            use_encoder_a   = use_encoder_a,
+            save    = True,
+            directory   = directory,
+            embedding_name  = embedding_name if embedding_name else self.nom,
             ** kwargs
         )
     
@@ -478,6 +484,86 @@ class BaseComparator(BaseModel):
     
     def embed_dataset_b(self, * args, ** kwargs):
         return self.embed_dataset(* args, use_encoder_a = False, ** kwargs)
+
+    def get_pipeline(self,
+                     use_encoder_a,
+                     
+                     id_key = 'filename',
+                     batch_size = 1,
+                     
+                     add_ab_prefix  = True,
+                     
+                     save   = True,
+                     directory  = None,
+                     embedding_name = _embedding_filename,
+                     ** kwargs
+                    ):
+        @timer
+        def preprocess(row, ** kw):
+            inputs = getattr(self, 'get_input_{}'.format(suffix))(row)
+            if not isinstance(row, (dict, pd.Series)): row = {}
+            row['processed'] = inputs
+            return row
+        
+        @timer
+        def inference(inputs, ** kw):
+            batch_inputs = inputs if isinstance(inputs, list) else [inputs]
+            
+            batch = [inp.pop('processed') for inp in batch_inputs]
+            batch = pad_batch(batch) if not isinstance(batch[0], (list, tuple)) else [
+                pad_batch(b) for b in zip(* batch)
+            ]
+            batch = getattr(self, 'preprocess_input_{}'.format(suffix))(batch)
+            
+            embeddings = encoder(batch, training = False)
+            
+            for row, embedding in zip(batch_inputs, embeddings): row[embedding_key] = embedding
+            
+            return inputs
+        
+        if save:
+            embedding_file = embedding_name
+            if '{}' in embedding_file: embedding_file = embedding_file.format(self.embedding_dim)
+            if not os.path.splitext(embedding_file)[1]: embedding_file += _default_embedding_ext
+            if directory is None: directory = self.pred_dir
+            filename = os.path.join(directory, embedding_file)
+        
+        suffix = 'a' if use_encoder_a else 'b'
+
+        encoder = self.encoder_a if use_encoder_a else use_encoder_b
+
+        embedding_key = 'embedding'
+        if add_ab_prefix:
+            embedding_key = '{}_{}'.format(
+                self.a_renaming if use_encoder_a else self.b_renaming, embedding_key
+            )
+
+        pipeline = Pipeline(** {
+            ** kwargs,
+            'filename'  : None if not save else filename,
+            'id_key'    : id_key,
+            'save_keys' : ['id', embedding_key],
+            'as_list'   : True,
+            
+            'tasks'     : [
+                preprocess,
+                {'consumer' : inference, 'batch_size' : batch_size, 'allow_multithread' : False}
+            ]
+        })
+        pipeline.start()
+        return pipeline
+    
+    @timer
+    def predict(self, data, use_encoder_a, ** kwargs):
+        pipeline = self.get_pipeline(use_encoder_a = use_encoder_a, ** kwargs)
+        
+        return pipeline.extend_and_wait(data, ** kwargs)
+
+    def predict_a(self, data, ** kwargs):
+        return self.predict(data, use_encoder_a = True, ** kwargs)
+
+    def predict_b(self, data, ** kwargs):
+        return self.predict(data, use_encoder_a = False, ** kwargs)
 
     def get_config(self, *args, ** kwargs):
         """ Return base configuration for a `siamese network` """

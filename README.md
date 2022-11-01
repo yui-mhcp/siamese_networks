@@ -82,6 +82,10 @@ Note : for [CLIP](https://openai.com/blog/clip/) models, weights are automatical
     - [x] Text - Text comparator (`TextSiamese`)
     - [x] Text - Image comparator ([CLIP](https://openai.com/blog/clip/))
     - [ ] Text - Video comparator
+- [ ] Implement a `Siamese`-like model supporting the `GE2E` loss
+    - [x] Implement a `data generator` that generates *N* items from the same *ID* consecutively (required by the GE2E loss)
+    - [ ] Implement a `BaseEncoder` class that is a simple `Encoder` model (in progress)
+    - [ ] Train and share encoder model trained with the GE2E loss
 
 ## What is Siamese Network ?
 
@@ -266,6 +270,7 @@ If you use this project in your work, please add this citation to give it more v
 Tutorials : 
 - [1] [Medium tutorial for animal recognition](https://miro.medium.com/max/1750/0*eeyjKVZFBdFjFQoK.png) : source of the introduction image. The tutorial seems to be clear, complete with a practical approach. 
 - [2] [Medium tutorial for speaker verification with siamese networks](https://medium.com/analytics-vidhya/building-a-speaker-identification-system-from-scratch-with-deep-learning-f4c4aa558a56) : the 1st tutorial I read on siamese networks. Its architecture was a 1st base model I improved. Clear, practical and with an interesting comparison between a classical classifier and a siamese-based approach. 
+- [3] [Google GE2E Loss tutorial](https://google.github.io/speaker-id/publications/GE2E/) : amazing Google tutorial explaining the benefits of the GE2E loss compared to the Siamese approach (which they call the `Tuple End-to-End (TE2E) loss`)
 
 Github project : 
 - [voicemap project](https://github.com/oscarknagg/voicemap) : github associated with the 2nd tutorial and my 1st inspiration for the `AudioSiamese` model

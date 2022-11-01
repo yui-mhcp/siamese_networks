@@ -35,15 +35,6 @@ HParamsBart     = HParamsTextTransformer(
 
 class BartEncoder(TextTransformerEncoder):
     default_params = HParamsBartEncoder
-    
-    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
-        from models.weights_converter import (
-            _transformer_patterns, name_based_partial_transfer_learning
-        )
-
-        return name_based_partial_transfer_learning(
-            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
-        )
 
     @classmethod
     def from_pretrained(cls,
@@ -56,12 +47,12 @@ class BartEncoder(TextTransformerEncoder):
             with tf.device('cpu') as d:
                 pretrained = transformers_bart(pretrained_name, pretrained_task)
 
-        config = HParamsBartEncoder(
+        config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
             embedding_dim   = pretrained.config.d_model,
             max_input_length    = pretrained.config.max_position_embeddings,
             positional_offset   = 2,
-            scale_embedding = False,
+            scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon = 1e-5,
 
             num_layers  = pretrained.config.encoder_layers,
@@ -115,15 +106,6 @@ class BartDecoder(TextTransformerDecoder):
             output = self.final_act_layer(output)
         return output
     
-    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
-        from models.weights_converter import (
-            _transformer_patterns, name_based_partial_transfer_learning
-        )
-
-        return name_based_partial_transfer_learning(
-            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
-        )
-    
     @classmethod
     def from_pretrained(cls,
                         pretrained_name = 'facebook/bart-large',
@@ -136,12 +118,12 @@ class BartDecoder(TextTransformerDecoder):
             with tf.device('cpu') as d:
                 pretrained = transformers_bart(pretrained_name, pretrained_task)
 
-        config = HParamsBartDecoder(
+        config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
             embedding_dim   = pretrained.config.d_model,
             max_input_length    = pretrained.config.max_position_embeddings,
             positional_offset   = 2,
-            scale_embedding = False,
+            scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon     = 1e-5,
             sos_token   = 0,
             eos_token   = 2,
@@ -190,12 +172,12 @@ class Bart(TextTransformer):
             with tf.device('cpu') as d:
                 pretrained = transformers_bart(pretrained_name, pretrained_task)
 
-        config = HParamsBart(
+        config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
             embedding_dim   = pretrained.config.d_model,
             max_input_length    = pretrained.config.max_position_embeddings,
             positional_offset   = 2,
-            scale_embedding = False,
+            scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon     = 1e-5,
             sos_token   = 0,
             eos_token   = 2,
@@ -223,6 +205,8 @@ class Bart(TextTransformer):
 def transformers_bart(name = 'facebook/bart-large', task = 'generation'):
     import transformers
     if task == 'generation':
+        if 'barthez' in name:
+            return transformers.AutoModelForSeq2SeqLM.from_pretrained(name)
         return transformers.TFBartForConditionalGeneration.from_pretrained(name)
     else:
         raise ValueError("Unknown task !\n  Accepted : {}\n  Got : {}".format(

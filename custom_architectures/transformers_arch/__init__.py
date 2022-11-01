@@ -60,7 +60,7 @@ def _get_pretrained(pretrained_name,
             pretrained_name = pretrained_name, ** kwargs
         )
     
-    for model_name, model_class in _possible_classes.items():
+    for model_name, model_class in sorted(_possible_classes.items(), key = lambda p: len(p[0]), reverse = True):
         if model_name in class_name:
             return model_class.from_pretrained(pretrained_name = pretrained_name, ** kwargs)
     

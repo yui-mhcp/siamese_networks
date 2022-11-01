@@ -92,7 +92,10 @@ class VisualTransformer(TransformerEncoder):
             self.positional_embedding   = self.add_weight(
                 shape = (ctx_length, self.embedding_dim), name = 'positional_embedding'
             )
-        
+    
+    @property
+    def input_dim(self):
+        return self.hparams.input_dim
             
     @property
     def dummy_inputs(self):
@@ -125,7 +128,9 @@ class VisualTransformer(TransformerEncoder):
             embedded = tf.reshape(embedded, [tf.shape(embedded)[0], -1, tf.shape(embedded)[-1]])
             
             embedded = tf.concat([
-                tf.broadcast_to(self.class_embedding, [tf.shape(embedded)[0], 1, tf.shape(embedded)[-1]]),
+                tf.broadcast_to(
+                    self.class_embedding, [tf.shape(embedded)[0], 1, tf.shape(embedded)[-1]]
+                ),
                 embedded
             ], axis = 1)
             embedded = embedded + tf.expand_dims(self.positional_embedding, axis = 0)

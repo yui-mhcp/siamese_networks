@@ -73,8 +73,8 @@ def concat_embeddings(embeddings,
     
     if debug:
         tf.print("Sequence lengths :", lengths)
-        tf.print("Question shape :", tf.shape(question))
-        tf.print("Contexts shape :", tf.shape(contexts))
+        tf.print("1st input shape :", tf.shape(question))
+        tf.print("2nd input shape :", tf.shape(contexts))
         if c_masks is not None:
             tf.print("Masks shape :", tf.shape(c_masks))
     
@@ -141,6 +141,19 @@ def concat_embeddings(embeddings,
                 tf.print("Masks (after merging) shape :", tf.shape(c_masks))
         
         ctx_types = tf.tile(ctx_types, [q_batch_size]) + n_doc_per_batch * ctx_add_type
+        
+        if c_masks is not None:
+            not_padding = tf.reduce_any(tf.reshape(c_masks, [c_batch_size, -1]) == 0, axis = 0)
+
+            contexts    = tf.boolean_mask(contexts, not_padding, axis = 1)
+            c_masks     = tf.boolean_mask(c_masks, not_padding, axis = 3)
+            ctx_types   = tf.boolean_mask(ctx_types, not_padding, axis = 0)
+            
+            if debug:
+                tf.print("# padding :", tf.reduce_sum(1 - tf.cast(not_padding, tf.int32)))
+                tf.print("Contexts (after removing padding) shape :", tf.shape(contexts))
+                tf.print("Masks (after removing padding) shape :", tf.shape(c_masks))
+
     
     types   = tf.concat([tf.fill([tf.shape(question)[1]], 0), ctx_types], axis = -1)
     
@@ -336,10 +349,10 @@ class MAGModelWrapper(tf.keras.Model):
               positional_offset = -1,
               force_not_subsampling = False,
               
-              return_state       = None,
-              return_attention   = None,
-              return_hidden_states   = None,
-              return_mask        = None,
+              return_state       = False,
+              return_attention   = False,
+              return_hidden_states   = False,
+              return_mask        = False,
               as_dict    = False,
               
               debug = False,
@@ -354,19 +367,19 @@ class MAGModelWrapper(tf.keras.Model):
             assert len(inputs) % 2 == 0
             
             if len(inputs) > 2:
-                if not isinstance(force_not_subsampling, (list, tuple)):
-                    force_not_subsampling = [force_not_subsampling] * (len(inputs) // 2)
-                if not isinstance(positional_offset, (list, tuple)):
-                    positional_offset = [positional_offset] * (len(inputs) // 2)
-                if token_types is not None and not isinstance(token_types, (list, tuple)):
-                    token_types = [token_types] * (len(inputs) // 2)
-                if position_ids is not None and not isinstance(position_ids, (list, tuple)):
-                    position_ids = [position_ids] * (len(inputs) // 2)
+                force_not_subsampling = tf.convert_to_tensor(force_not_subsampling)
+                positional_offset     = tf.convert_to_tensor(positional_offset)
                 
-                assert len(force_not_subsampling) == len(inputs) // 2, '{} vs {}'.format(len(force_not_subsampling), len(inputs))
-                assert len(positional_offset) == len(inputs) // 2, '{} vs {}'.format(len(positional_offset), len(inputs))
+                if len(tf.shape(force_not_subsampling)) == 0:
+                    force_not_subsampling = tf.repeat(
+                        tf.expand_dims(force_not_subsampling, axis = 0), len(inputs) // 2
+                    )
+                if len(tf.shape(positional_offset)) == 0:
+                    positional_offset = tf.repeat(
+                        tf.expand_dims(positional_offset, axis = 0), len(inputs) // 2
+                    )
                 
-                embeddings      = []
+                embeddings      = ()
                 states          = () if return_state else None
                 attn_weights    = () if return_attention else None
                 hidden_states   = () if return_hidden_states else None
@@ -393,7 +406,7 @@ class MAGModelWrapper(tf.keras.Model):
                         debug   = debug,
                         ** kwargs
                     )
-                    embeddings.append(outputs_i.output)
+                    embeddings = embeddings + (outputs_i.output, )
                     if return_state:
                         states = states + (outputs_i.state, )
                     if return_attention:
@@ -511,11 +524,11 @@ class MAGModelWrapper(tf.keras.Model):
              merge_embeddings   = False,
              positional_offset  = -1, 
              
-             return_state       = None,
-             return_attention   = None,
-             return_last_attention  = None,
-             return_hidden_states   = None,
-             return_mask        = None,
+             return_state       = False,
+             return_attention   = False,
+             return_last_attention  = False,
+             return_hidden_states   = False,
+             return_mask        = False,
              as_dict    = False,
              
              ** kwargs

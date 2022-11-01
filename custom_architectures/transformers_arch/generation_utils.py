@@ -42,10 +42,12 @@ TransformerInferenceState   = collections.namedtuple(
     ]
 )
 
-def get_shape_invariant(model, encoder_output = None, return_attention = None, ** kwargs):
+def get_shape_invariant(model, encoder_output = None, return_attention = None, use_cache = False,
+                        ** kwargs):
     logits_shape, attn_shapes = model.get_output_shape(
         (None, None),
         encoder_output      = encoder_output.shape if encoder_output is not None else None,
+        return_state        = use_cache,
         return_attention    = return_attention,
         return_last_attention   = True
     )
@@ -64,66 +66,35 @@ def get_shape_invariant(model, encoder_output = None, return_attention = None, *
     )
 
 @timer
-def infer(model,
-          * args,
-          method = 'greedy',
-          
-          max_length    = None,
-
-          return_state       = None,
-          return_attention   = None,
-          return_hidden_states   = None,
-          return_mask        = None,
-          as_dict    = False,
-
-          ** kwargs
-         ):
-    if max_length is None:              max_length = model.max_input_length
-    if return_state is None:            return_state = model.return_state
-    if return_attention is None:        return_attention = model.return_attention
-    if return_hidden_states is None:    return_hidden_states = model.return_hidden_states
-    if return_mask is None:             return_mask = model.return_mask
-
+def infer(model, * args, method = 'greedy', ** kwargs):
     return get_object(
-        _inference_methods,
-        method,
-        * args,
-            
-        model = model,
-        max_length      = max_length,
-        return_state    = return_state,
-        return_attention    = return_attention,
-        return_hidden_states    = return_hidden_states,
-        return_mask         = return_mask,
-        as_dict     = as_dict,
-        
-        ** kwargs
+        _inference_methods, method, model, * args, ** kwargs
     )
 
-def _infer(model,
+@tf.function(experimental_relax_shapes = True)
+def _infer(self,
            tokens    = None,
            input_length  = None,
            encoder_output    = None,
            initial_state     = None,
-          
+           prefix       = None,
+           
            enc_padding_mask  = None,
            padding_mask  = None,
            training  = False,
            use_cache = False,
            
-           batch_size   = None,
-           sos_token    = None,
-           eos_token    = None,
-           max_length   = None,
+           batch_size   = -1,
+           max_length   = -1,
            use_sampling = False,
            early_stopping    = True,
 
-           return_state       = None,
-           return_attention   = None,
-           return_last_attention    = None,
-           return_hidden_states   = None,
-           return_mask        = None,
-           as_dict    = False,
+           return_state       = False,
+           return_attention   = False,
+           return_last_attention    = False,
+           return_hidden_states   = False,
+           return_mask        = False,
+           as_dict    = True,
 
            ** kwargs
           ):
@@ -131,14 +102,17 @@ def _infer(model,
         return not (early_stopping and tf.reduce_sum(finished) == batch_size)
     
     def body(tokens, input_length, padding_mask, finished, logits, scores, attn_weights):
-        outputs = model(
+        outputs = self(
             tokens,
             input_length    = input_length,
             encoder_output  = encoder_output,
+            prefix  = prefix if not use_cache or tf.shape(tokens)[1] == 1 else None,
             padding_mask    = padding_mask,
             enc_padding_mask    = enc_padding_mask,
             positional_offset   = -1 if not use_cache else input_length - 1 + model.positional_offset,
             training    = training,
+            
+            apply_softmax   = False,
             
             return_state    = use_cache,
             return_attention    = return_attention,
@@ -149,25 +123,23 @@ def _infer(model,
             
             ** kwargs
         )
-        logits      = outputs.output
+        logits      = log_softmax(outputs.output[:, -1, :], axis = -1)
         
-        next_token  = _select_next_token(
-            logits[:, -1, :], n = 1, previous = tokens, use_sampling = use_sampling
-        )
-        
-        scores  = scores + tf.gather(logits[:, -1, :], next_token, batch_dims = 1) * tf.cast(1-finished, scores.dtype)
-        
-        next_token  = tf.reshape(
-            tf.cast(next_token, tokens.dtype), [batch_size, 1]
-        )
+        next_token  = tf.cast(_select_next_token(
+            logits, n = 1, previous = tokens, use_sampling = use_sampling
+        ), tf.int32)
 
-        tokens  = tf.concat([tokens, next_token], axis = -1)
+        scores = scores + tf.cast(1 - finished, logits.dtype) * tf.gather(logits, next_token, batch_dims = 1)
+
+        tokens = tf.concat([
+            tokens, tf.expand_dims(next_token, axis = 1)
+        ], axis = -1)
 
         finished    = tf.maximum(
-            finished, tf.cast(tf.math.equal(next_token[:, 0], eos_token), tf.int32)
+            finished, tf.cast(tf.math.equal(next_token, self.eos_token), finished.dtype)
         )
-        
-        input_length += 1 - tf.expand_dims(finished, axis = 1)
+
+        input_length += tf.expand_dims(1 - finished, axis = 1)
         padding_mask = tf.concat([
             padding_mask,
             tf.reshape(tf.cast(finished, padding_mask.dtype), [-1, 1, 1, 1])
@@ -178,26 +150,29 @@ def _infer(model,
             input_length    = input_length,
             padding_mask    = padding_mask,
             finished    = finished,
-            logits      = logits,
+            logits      = outputs.output,
             scores      = scores,
             attention_weights   = outputs.attention_weights if not skip_attention else attn_weights
         )
     
-    skip_attention = not return_attention and not return_last_attention
+    if max_length < 0: max_length = self.max_input_length
     
-    if encoder_output is not None:
-        batch_size = tf.shape(encoder_output)[0]
+    skip_attention = not (return_attention or return_last_attention)
+    
+    if batch_size == -1:
+        assert encoder_output is not None or tokens is not None or prefix is not None
+        if tokens is not None:
+            batch_size = tf.shape(tokens)[0]
+        elif encoder_output is not None:
+            batch_size = tf.shape(encoder_output)[0]
+        else:
+            batch_size = tf.shape(prefix)[0]
     
     if tokens is None:
-        assert batch_size is not None, 'Provide either `encoder_output ` or `batch_size`'
-        tokens          = tf.fill((batch_size, 1), sos_token)
+        tokens          = tf.fill((batch_size, 1), self.sos_token)
         input_length    = tf.fill((batch_size, 1), 1)
     elif isinstance(tokens, (list, tuple)):
         tokens, input_length    = tokens
-    
-    if batch_size is None: batch_size      = tf.shape(tokens)[0]
-    
-    assert batch_size is not None, 'Please provide either `tokens`, `encoder_output` or `batch_size`'
     
     if input_length is None:
         input_length    = tf.fill((batch_size,), tf.shape(tokens)[1])
@@ -205,10 +180,15 @@ def _infer(model,
     if padding_mask is None:
         padding_mask    = create_padding_mask(tokens, seq_len = input_length, dtype = tf.float32)
 
+    if prefix is not None and tf.shape(padding_mask)[-1] == tf.shape(tokens)[1]:
+        padding_mask = tf.concat([
+            tf.zeros((batch_size, 1, 1, tf.shape(prefix)[1]), dtype = tf.float32), padding_mask
+        ], axis = -1)
+        
     shapes_invariant    = get_shape_invariant(
-        model, encoder_output = encoder_output, return_attention = return_attention
+        self, encoder_output = encoder_output, return_attention = return_attention
     )
-    outputs = tf.while_loop(
+    outputs = tf.nest.map_structure(tf.stop_gradient, tf.while_loop(
         cond    = cond,
         body    = body,
         loop_vars   = TransformerInferenceState(
@@ -225,47 +205,47 @@ def _infer(model,
         ),
         shape_invariants    = shapes_invariant,
         maximum_iterations  = max_length
-    )
+    ))
     
     return TransformerInferenceOutput(
-        tokens  = outputs.tokens[..., 1:],
-        lengths = tf.reshape(outputs.input_length, [-1]) -1,
+        tokens  = outputs.tokens[:, 1:],
+        lengths = tf.squeeze(outputs.input_length, axis = 1) - 1,
         score   = outputs.scores,
         output  = outputs.logits,
         attention_weights   = outputs.attention_weights if not skip_attention else None
     )
 
-def _infer_beam_search(model,
-                       vocab_size,
+@tf.function(experimental_relax_shapes = True)
+def _infer_beam_search(self,
                        tokens    = None,
                        input_length  = None,
                        encoder_output    = None,
                        initial_state     = None,
+                       prefix       = None,
+
+                       num_beams    = 10,
+                       num_sentences    = 5,
 
                        temperature  = 1.,
                        length_temperature   = 0.,
                        length_power = 0.,
-                       num_beams    = 10,
-                       num_sentences    = 5,
 
                        enc_padding_mask  = None,
                        padding_mask  = None,
                        training  = False,
                        use_cache = False,
 
-                       batch_size   = None,
-                       sos_token    = None,
-                       eos_token    = None,
-                       max_length   = None,
+                       batch_size   = -1,
+                       max_length   = -1,
                        use_sampling = False,
                        early_stopping    = True,
 
-                       return_state       = None,
-                       return_attention   = None,
-                       return_last_attention    = None,
-                       return_hidden_states   = None,
-                       return_mask        = None,
-                       as_dict    = False,
+                       return_state       = False,
+                       return_attention   = False,
+                       return_last_attention    = False,
+                       return_hidden_states   = False,
+                       return_mask        = False,
+                       as_dict    = True,
 
                        ** kwargs
                       ):
@@ -276,10 +256,11 @@ def _infer_beam_search(model,
         return tf.reduce_sum(finished_per_batch[:,:num_sentences]) != batch_size * num_sentences
     
     def body(tokens, input_length, padding_mask, finished, logits, scores, attn_weights):
-        outputs = model(
+        outputs = self(
             tokens,
             input_length    = input_length,
             encoder_output  = encoder_output,
+            prefix  = prefix if not use_cache or tf.shape(tokens)[1] == 1 else None,
             padding_mask    = padding_mask,
             enc_padding_mask    = enc_padding_mask,
             positional_offset   = -1 if not use_cache else input_length - 1 + model.positional_offset,
@@ -295,10 +276,10 @@ def _infer_beam_search(model,
             
             ** kwargs
         )
-        finish_mask = tf.expand_dims(tf.cast(1 - finished, tf.float32), axis = 1)
+        not_finish_mask = tf.expand_dims(tf.cast(1 - finished, tf.float32), axis = 1)
 
         logits  = outputs.output[:, -1, :]
-        if temperature != 1.:
+        if temperature != 0.:
             logits = logits / temperature
         
         if length_temperature != 0.:
@@ -307,34 +288,31 @@ def _infer_beam_search(model,
                 temp = tf.maximum(tf.math.log(_lengths), 1.)
             else:
                 temp = _lengths ** length_temperature
-            temp = 1. / temp
 
-            logits = logits / temp
+            logits = logits * temp
         
-        beam_scores = log_softmax(logits, axis = -1) * finish_mask
-        beam_scores = beam_scores + tf.expand_dims(scores, axis = 1)
+        logits = logits * not_finish_mask + (1 - not_finish_mask) * eos_mask
+
+        beam_scores = log_softmax(logits, axis = -1) + tf.expand_dims(scores, axis = 1)
         
         if tf.shape(tokens)[1] == 1:
             mask = tf.expand_dims(
                 tf.cast(tf.tile(tf.range(num_beams), [batch_size]) == 0, tf.float32), axis = -1
             )
-        else:
-            mask    = tf.cast(tf.range(vocab_size) != eos_token, tf.float32)
-            mask    = tf.tile(tf.expand_dims(mask, 0), [effective_batch_size, 1])
-            mask    = 1. - (mask * tf.expand_dims(tf.cast(finished, tf.float32), axis = 1))
+            beam_scores = beam_scores * mask + (1 - mask) * -1e4
 
-        reshaped_scores = beam_scores * mask + (1. - mask) * -1e4
-        reshaped_scores = reshaped_scores / (tf.cast(input_length, tf.float32) ** length_power)
+        reshaped_scores = beam_scores / (tf.cast(input_length, tf.float32) ** length_power)
         reshaped_scores = tf.reshape(reshaped_scores, [batch_size, -1])
 
         next_token  = _select_next_token(
             reshaped_scores, n = num_beams, previous = None, use_sampling = use_sampling
         )
         next_token  = tf.reshape(
-            tf.cast(next_token, tokens.dtype), [effective_batch_size, 1]
+            tf.cast(next_token, tokens.dtype), [effective_batch_size]
         )
-        token_batch_idx = tf.reshape(next_token // vocab_size, [-1]) + batch_idx_add
-        next_token      = next_token % vocab_size
+        
+        token_batch_idx = next_token // self.vocab_size + batch_idx_add
+        next_token      = next_token % self.vocab_size
         
         beam_scores     = tf.gather(beam_scores,    token_batch_idx)
         input_length    = tf.gather(input_length,   token_batch_idx)
@@ -347,16 +325,15 @@ def _infer_beam_search(model,
         else:
             attention_weights   = outputs.attention_weights
         
-        scores          = tf.reshape(
-            tf.gather(beam_scores, next_token, batch_dims = 1, axis = -1), [-1]
-        )
+        scores = tf.gather(beam_scores, next_token, batch_dims = 1)
+
         tokens  = tf.concat([
             tf.gather(tokens, token_batch_idx),
-            next_token
+            tf.expand_dims(next_token, axis = 1)
         ], axis = -1)
 
         finished    = tf.maximum(
-            finished, tf.cast(tf.math.equal(next_token[:,0], eos_token), tf.int32)
+            finished, tf.cast(tf.math.equal(next_token, self.eos_token), tf.int32)
         )
         
         input_length += 1 - tf.expand_dims(finished, axis = 1)
@@ -375,39 +352,59 @@ def _infer_beam_search(model,
             attention_weights   = attention_weights if not skip_attention else attn_weights
         )
 
+    if max_length == -1: max_length = self.max_input_length
+    
     skip_attention  = not return_attention and not return_last_attention
     
     temperature     = tf.cast(temperature, tf.float32)
     length_power    = tf.cast(length_power, tf.float32)
     length_temperature  = tf.cast(length_temperature, tf.float32)
     
+    if batch_size == -1:
+        assert encoder_output is not None or tokens is not None or prefix is not None
+        if tokens is not None:
+            batch_size = tf.shape(tokens)[0]
+        elif encoder_output is not None:
+            batch_size = tf.shape(encoder_output)[0]
+        else:
+            batch_size = tf.shape(prefix)[0]
+    
     if encoder_output is not None:
-        batch_size = tf.shape(encoder_output)[0]
-
         encoder_output  = tf.repeat(encoder_output, num_beams, axis = 0)
         if enc_padding_mask is not None:
             enc_padding_mask  = tf.repeat(enc_padding_mask, num_beams, axis = 0)
-    
-    assert batch_size is not None, 'Please provide either `tokens`, `encoder_output` or `batch_size`'
 
+    if prefix is not None:
+        prefix = tf.repeat(prefix, num_beams, axis = 0)
+    
     effective_batch_size    = batch_size * num_beams
 
     if tokens is None:
-        tokens          = tf.fill((effective_batch_size, 1), sos_token)
-        input_length    = tf.fill((effective_batch_size, 1), 1)
-    
-    if input_length is None:
-        input_length    = tf.fill((effective_batch_size,), tf.shape(tokens)[1])
+        tokens = tf.fill((effective_batch_size, 1), self.sos_token)
+        input_length = tf.fill((effective_batch_size, 1), 1)
+    else:
+        tokens = tf.repeat(tokens, num_beams, axis = 0)
+        if input_length is None:
+            input_length = tf.fill((effective_batch_size,), tf.shape(tokens)[1])
+        else:
+            input_length = tf.repeat(input_length, num_beams, axis = 0)
     
     if padding_mask is None:
         padding_mask    = create_padding_mask(tokens, seq_len = input_length, dtype = tf.float32)
     
+    if prefix is not None and tf.shape(padding_mask)[-1] == tf.shape(tokens)[1]:
+        padding_mask = tf.concat([
+            tf.zeros((effective_batch_size, 1, 1, tf.shape(prefix)[1]), dtype = tf.float32),
+            padding_mask
+        ], axis = -1)
+
     batch_idx_add   = tf.repeat(tf.range(batch_size), num_beams, axis = 0) * num_beams
-    
+    eos_mask        = tf.expand_dims(tf.cast(tf.range(self.vocab_size) != self.eos_token, tf.float32), axis = 0) * -1e4
+
     shapes_invariant    = get_shape_invariant(
-        model, encoder_output = encoder_output, return_attention = return_attention
+        self, encoder_output = encoder_output, return_attention = return_attention
     )
-    outputs = tf.while_loop(
+    outputs = tf.nest.map_structure(tf.stop_gradient, tf.while_loop(
         cond    = cond,
         body    = body,
         loop_vars   = TransformerInferenceState(
@@ -424,11 +421,11 @@ def _infer_beam_search(model,
         ),
         shape_invariants    = shapes_invariant,
         maximum_iterations  = max_length
-    )
+    ))
     
     scores  = outputs.scores
     if length_power != 0:
-        lengths = tf.cast(tf.reshape(outputs.input_length, tf.shape(outputs.scores)), tf.float32)
+        lengths = tf.cast(tf.squeeze(outputs.input_length, axis = 1), tf.float32)
         scores  = outputs.scores / (lengths ** length_power)
     
     attn_weights = None
@@ -442,15 +439,10 @@ def _infer_beam_search(model,
     
     return TransformerInferenceOutput(
         tokens  = tf.reshape(outputs.tokens, [batch_size, num_beams, -1])[:, :num_sentences, 1:],
-        lengths = tf.reshape(outputs.input_length, [batch_size, num_beams])[:, :num_sentences],
+        lengths = tf.reshape(outputs.input_length, [batch_size, num_beams])[:, :num_sentences] - 1,
         score   = tf.reshape(scores,         [batch_size, num_beams])[:, :num_sentences],
         output  = tf.reshape(outputs.logits, [batch_size, num_beams, tf.shape(outputs.logits)[1], -1])[:, :num_sentences],
         attention_weights   = attn_weights
-    )
-
-def _score_output(probs, indices):
-    return tf.reduce_mean(
-        tf.math.log(tf.gather(probs, indices, batch_dims = 2, axis = -1)), axis = -1
     )
 
 def _select_next_token(scores, n = 1, previous = None, use_sampling = False):

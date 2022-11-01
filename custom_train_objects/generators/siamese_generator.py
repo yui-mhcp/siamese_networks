@@ -14,62 +14,41 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from tqdm import tqdm
 from sklearn.utils import shuffle as sklearn_shuffle
 
-from datasets.dataset_utils import prepare_dataset, build_siamese_dataset
+from custom_train_objects.generators.file_cache_generator import FileCacheGenerator
 
-class SiameseGenerator(tf.keras.utils.Sequence):
+class SiameseGenerator(FileCacheGenerator):
     def __init__(self,
                  # General informations
                  dataset,
-                 # Cache parameters
-                 min_apparition = 3,
-                 cache_size     = 30000,
-                 preload        = False,
                  # Column for merging / loading
                  id_column  = 'id',
                  file_column    = 'filename',
                  processed_column   = '',
-                 # additional informations
-                 shuffle        = False,
+
                  suffixes       = ('_x', '_y'), 
-                 random_state   = 10,
                  
                  ** kwargs
                 ):
-        assert isinstance(dataset, pd.DataFrame)
-        self.dataset    = dataset
-        
-        self.shuffle        = shuffle
+        super().__init__(
+            dataset,
+            id_column   = id_column,
+            file_column = file_column,
+            processed_column    = processed_column,
+            ** kwargs
+        )
         self.suffixes       = suffixes
-        self.random_state   = random_state
         
-        self.cache      = {}
-        self.cache_size = cache_size
-        self.min_apparition = min_apparition
-        
-        self.id_column  = id_column
         self.id_col_x   = self.id_column + self.suffixes[0]
         self.id_col_y   = self.id_column + self.suffixes[1]
         
-        self.file_column   = file_column
         self.file_col_x = self.file_column + self.suffixes[0]
         self.file_col_y = self.file_column + self.suffixes[1]
         
-        self.processed_column   = processed_column
         self.processed_col_x = self.processed_column + self.suffixes[0]
         self.processed_col_y = self.processed_column + self.suffixes[1]
         
-        self.save   = None
-        self.not_same   = None
-        self.unique_files   = None
-        self.frequencies    = None
-        self.files_to_cache = None
-        
-        self.build_datasets(** kwargs)
-        self.build_cache(cache_size, min_apparition, preload)
-    
     @property
     def processed_output_shape(self):
         raise NotImplementedError
@@ -77,7 +56,9 @@ class SiameseGenerator(tf.keras.utils.Sequence):
     def load_file(self, filename):
         raise NotImplementedError
 
-    def build_datasets(self, ** kwargs):
+    def build(self, ** kwargs):
+        from datasets.dataset_utils import build_siamese_dataset
+        
         kwargs.setdefault('random_state', self.random_state)
         self.same, self.not_same = build_siamese_dataset(
             self.dataset,
@@ -88,49 +69,7 @@ class SiameseGenerator(tf.keras.utils.Sequence):
             ** kwargs
         )
         
-        self.unique_files, self.frequencies = self.get_uniques()
-    
-    def get_uniques(self):
-        uniques = {}
-        for file in self.all_files:
-            uniques.setdefault(file, 0)
-            uniques[file] += 1
-            
-        return np.array(list(uniques.keys())), np.array(list(uniques.values()))
-        
-    def build_cache(self, size, min_apparition = 2, preload = False):
-        # compute 'size' most present files (in 2 ds)
-        cache_idx   = np.flip(np.argsort(self.frequencies))[:size]
-        to_cache    = self.unique_files[cache_idx]
-        # get files with at least 'min_apparition' apparition
-        freq        = self.frequencies[cache_idx]
-        to_cache    = to_cache[np.where(freq >= min_apparition)]
-        
-        self.files_to_cache = to_cache
-        
-        if preload:
-            self.load_cache()
-        
-        return to_cache
-    
-    def load_cache(self, tqdm = tqdm, ** kwargs):
-        self.cache = {f : self.cache[f] for f in self.unique_files if f in self.cache}
-        
-        not_cached = np.array([f for f in self.files_to_cache if f not in self.cache])
-        ds = prepare_dataset(
-            pd.DataFrame([{'filename' : f} for f in not_cached]),
-            batch_size  = 0,                     
-            map_fn      = self.load_file,
-            prefetch    = True,
-            cache       = False,
-            ** kwargs
-        )
-        for filename, processed in tqdm(zip(not_cached, ds), total = len(not_cached)):
-            self.cache[filename] = processed
-    
-    @property
-    def ids(self):
-        return self.same[self.id_column].unique()
+        self.ids = self.same[self.id_column].unique()
     
     @property
     def all_ids(self):
@@ -150,51 +89,29 @@ class SiameseGenerator(tf.keras.utils.Sequence):
         ])
             
     @property
-    def output_types(self):
-        types = {
-            self.processed_column   : tf.float32,
-            self.file_column    : tf.string,
+    def output_signature(self):
+        signatures  = {
+            self.processed_column   : tf.TensorSpec(
+                shape = self.processed_output_shape, dtype = tf.float32
+            ),
+            self.file_column    : tf.TensorSpec(shape = (), dtype = tf.string),
         }
-        same_types = {self.id_column : tf.string}
-        not_same_types = {
-            self.id_column + suffix : tf.string for suffix in self.suffixes
+        same_sign   = {self.id_column : tf.TensorSpec(shape = (), dtype = tf.string)}
+        not_same_sign = {
+            self.id_column + suffix : tf.TensorSpec(shape = (), dtype = tf.string)
+            for suffix in self.suffixes
         }
-        for k, t in types.items():
+        for k, sign in signatures.items():
             for suffix in self.suffixes:
-                same_types[k + suffix] = t
-                not_same_types[k + suffix] = t
+                same_sign[k + suffix] = sign
+                not_same_sign[k + suffix] = sign
         
-        return (same_types, not_same_types)
-    
-    @property
-    def output_shapes(self):
-        shapes = {
-            self.processed_column   : self.processed_output_shape,
-            self.file_column    : [],
-        }
-        same_shapes = {self.id_column : []}
-        not_same_shapes = {
-            self.id_column + suffix : [] for suffix in self.suffixes
-        }
-        for k, t in shapes.items():
-            for suffix in self.suffixes:
-                same_shapes[k + suffix] = t
-                not_same_shapes[k + suffix] = t
-        
-        return (same_shapes, not_same_shapes)
+        return (same_sign, not_same_sign)
     
     def __str__(self):
-        des = "Siamese Generator :\n"
-        des += "- Unique ids : {}\n".format(len(self.ids))
+        des = super().__str__()
         des += "- Same dataset length     : {}\n".format(len(self.same))
         des += "- Not same dataset length : {}\n".format(len(self.not_same))
-        des += "- Total files  : {}\n".format(len(self.all_files))
-        des += "- Unique files : {} ({:.2f} %)\n".format(
-            len(self.unique_files), 100 * len(self.unique_files) / len(self.all_files)
-        )
-        des += "- Cache size   : {} (loaded : {:.2f} %)".format(
-            len(self.files_to_cache), 100 * len(self.cache) / len(self.files_to_cache)
-        )
         return des
     
     def __len__(self):
@@ -205,7 +122,7 @@ class SiameseGenerator(tf.keras.utils.Sequence):
             self.same       = sklearn_shuffle(self.same)
             self.not_same   = sklearn_shuffle(self.not_same)
         return self.get_same(idx), self.get_not_same(idx)
-        
+    
     def get_same(self, idx):
         if idx > len(self.same): idx = idx % len(self.same)
         row = self.same.loc[idx]
@@ -230,15 +147,6 @@ class SiameseGenerator(tf.keras.utils.Sequence):
             self.processed_col_x    : self.load(row[self.file_col_x]),
             self.processed_col_y    : self.load(row[self.file_col_y])
         }
-    
-    def load(self, filename):
-        if filename not in self.cache:
-            data = self.load_file(filename)
-            if filename not in self.files_to_cache: return data
-            
-            self.cache[filename] = data
-        
-        return self.cache[filename]
     
     def sample(self, n = 1, ids = None, random_state = None, ** kwargs):
         if not random_state: random_state = self.random_state

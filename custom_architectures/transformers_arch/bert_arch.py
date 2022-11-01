@@ -64,7 +64,7 @@ class BaseBERT(TextTransformerEncoder):
         super().__init__(vocab_size = vocab_size, embedding_dim = embedding_dim, ** kwargs)
 
         self.pooler = BertPooler(** self.hparams, name = "pooler") if self.hparams.use_pooling else None
-        
+    
     def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
         return (encoder_outputs, pooled_outputs)
     
@@ -73,13 +73,6 @@ class BaseBERT(TextTransformerEncoder):
 
         return self.process_outputs(
             output, pooled_output, mask = mask, training = training
-        )
-
-    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
-        from models.weights_converter import _transformer_patterns, name_based_partial_transfer_learning
-
-        return name_based_partial_transfer_learning(
-            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
         )
 
     @classmethod
@@ -93,7 +86,7 @@ class BaseBERT(TextTransformerEncoder):
             with tf.device('cpu') as d:
                 pretrained = transformers_bert(pretrained_name, pretrained_task)
 
-        config = HParamsBaseBERT(
+        config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
             max_token_types = pretrained.config.type_vocab_size,
             max_input_length    = pretrained.config.max_position_embeddings,
