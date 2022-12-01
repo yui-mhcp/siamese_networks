@@ -112,12 +112,16 @@ class FileCacheGenerator(tf.keras.utils.Sequence):
         
         self.files_to_cache = set(to_cache)
         
-        if preload: self.load_cache()
+        if preload: self.load_cache(** kwargs)
         
         return to_cache
     
-    def load_cache(self, tqdm = tqdm, ** kwargs):
+    def load_cache(self, tqdm = tqdm, filename = None, ** kwargs):
         from datasets import prepare_dataset
+        
+        if filename:
+            from utils.file_utils import load_data
+            self.cache.update(load_data(filename))
         
         self.cache = {f : self.cache[f] for f in self.unique_files if f in self.cache}
         
@@ -142,3 +146,8 @@ class FileCacheGenerator(tf.keras.utils.Sequence):
             self.cache[filename] = data
         
         return self.cache[filename]
+
+    def save_cache(self, filename):
+        from utils.file_utils import dump_data
+        dump_data(filename = filename, data = self.cache)
+    
