@@ -46,11 +46,11 @@ Note : CLIP is a newly added model and is still experimental. It is properly wor
 | Input types   | Dataset   | Architecture  | Embedding dim | Trainer   | Weights   |
 | :-----------: | :-------: | :-----------: | :-----------: | :-------: | :-------: |
 | mel-spectrogram   | [LibriSpeech](http://www.openslr.org/12)  | `AudioSiamese (CNN 1D + LSTM)`   | 256   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1-WWfmQs7pGRQpcZPI6mn9c4FTWnrHZem/view?usp=sharing)  |
+| mel-spectrogram   | [VoxForge](http://www.voxforge.org/), [CommonVoice](https://commonvoice.mozilla.org/fr/datasets) | `AudioEncoder (CNN 1D + LSTM)`   | 256   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1bzj9412l0Zje3zLaaqGOBNaQRBYLVO2q/view?usp=share_link)  |
 | text (tokens) | [SNLI](https://nlp.stanford.edu/projects/snli/)  | `TextSiamese (BERT + Bi-LSTM)`   | 512   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/17s2PTlI33C23pEvucK0dagCINEW7g0DH/view?usp=sharing)  |
 | 10-digit  | `MNIST`   | `ImageSiamese`    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1NaArsbICsb8lvPuOLKgw_fOHPKsU3YBC/view?usp=sharing)  |
 | 10        | `Fashion MNIST`   | `ImageSiamese`    | 64    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/13V9uKj-6U2jZDN9w-tSIl64ACybZwVZ2/view?usp=sharing)  |
 | 10        | `Fashion MNIST`   | `ImageSiamese`    | 64    | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1CqY-CrsWCkKNqYuewFe2t9leWb3QSDfQ/view?usp=sharing)  |
-
 
 Models must be unzipped in the `pretrained_models/` directory !
 

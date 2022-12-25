@@ -16,8 +16,8 @@ import glob
 from utils.generic_utils import to_lower_keys
 
 def __load():
-    for module_name in glob.glob(os.path.join('custom_architectures', 'transformers_arch/*.py')):
-        if os.path.basename(module_name) in ['__init__.py']: continue
+    for module_name in glob.glob(os.path.join('custom_architectures', 'transformers_arch', '*.py')):
+        if module_name.endswith('__init__.py'): continue
         module_name = module_name.replace(os.path.sep, '.')[:-3]
 
         module = __import__(

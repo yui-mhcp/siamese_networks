@@ -71,7 +71,7 @@ def infer(model, * args, method = 'greedy', ** kwargs):
         _inference_methods, method, model, * args, ** kwargs
     )
 
-@tf.function(experimental_relax_shapes = True)
+@tf.function(reduce_retracing = True)
 def _infer(self,
            tokens    = None,
            input_length  = None,
