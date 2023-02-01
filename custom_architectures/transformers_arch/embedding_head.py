@@ -119,10 +119,8 @@ class EmbeddingHead(tf.keras.layers.Layer):
     def call(self, inputs, mask = None, training = False, text = None, ** kwargs):
         output = self.select_token(inputs, text = text)
         
-        if mask is not None and self.token_selector > 0:
-            mask = tf.cast(
-                1. - tf.reshape(mask, [tf.shape(output)[0], tf.shape(output)[1]]), tf.bool
-            )
+        if mask is not None and len(tf.shape(output)) == 3:
+            mask = tf.cast(mask[:, 0, 0, :], tf.bool)
         
         if self.hidden_layer is not None:
             if self.hparams.hidden_layer_type != 'dense':

@@ -11,16 +11,13 @@
 
 """ TF 2.0 CLIP (Visual Transformer), compatible with the official CLIP implementation """
 
-import numpy as np
 import tensorflow as tf
 
-from loggers import timer
-from utils import download_file
 from custom_layers import get_activation, FasterEmbedding
 from custom_architectures.current_blocks import _get_pooling_layer
 from custom_architectures.transformers_arch.embedding_head import HParamsEmbeddingHead, EmbeddingHead
 from custom_architectures.transformers_arch.transformer_arch import (
-    HParamsTransformerEncoder, TransformerEncoder, TransformerOutput
+    HParamsTransformerEncoder, TransformerEncoder
 )
 
 HParamsVisualTransformer  = HParamsTransformerEncoder(
@@ -43,23 +40,23 @@ HParamsVisualTransformer  = HParamsTransformerEncoder(
     conv_drop_rate  = 0.1,
     
     normalize   = 'middle',
+    normalize_output    = True,
     mha_normalize   = False,
     mha_normalize_input = True,
+    
     ffn_activation  = 'quick_gelu',
+    
     mha_epsilon     = 1e-5,
     epsilon     = 1e-5
 )
 
 class VisualTransformer(TransformerEncoder):
     default_params  = HParamsVisualTransformer
+    _attr_to_set    = TransformerEncoder._attr_to_set + ['input_dim']
     
     def __init__(self, input_dim, embedding_dim, ** kwargs):
         super().__init__(
             input_dim = input_dim, embedding_dim = embedding_dim, ** kwargs
-        )
-        
-        self.out_norm   = tf.keras.layers.LayerNormalization(
-            epsilon = self.hparams.epsilon, name = 'norm_output'
         )
         
         self.embedding_head = EmbeddingHead(** self.hparams, name = 'embedding_layer')
@@ -74,7 +71,7 @@ class VisualTransformer(TransformerEncoder):
             name        = 'conv1'
         )
         self.conv_norm  = tf.keras.layers.LayerNormalization(
-            epsilon = self.hparams.epsilon, name = 'norm_pre'
+            epsilon = self.hparams.epsilon, name = 'norm_conv'
         ) if self.hparams.conv_normalize else None
         self.conv_act   = get_activation(self.hparams.conv_activation)
         self.pooling    = _get_pooling_layer(
@@ -94,71 +91,49 @@ class VisualTransformer(TransformerEncoder):
             )
     
     @property
-    def input_dim(self):
-        return self.hparams.input_dim
-            
-    @property
-    def dummy_inputs(self):
-        return tf.random.uniform(
-            shape = (2, self.hparams.input_dim, self.hparams.input_dim, 3), minval = 0., maxval = 1.
-        )
+    def input_signature(self):
+        return tf.TensorSpec(shape = (None, self.input_dim, self.input_dim, 3), dtype = tf.float32)
     
-    def compute_output(self, output, training = False, mask = None, image = None, ** kwargs):
-        output = self.out_norm(output, training = training and self.norm_training)
+    def compute_output(self, output, training = False, mask = None, inputs = None, ** kwargs):
+        output = super().compute_output(output, training = training, mask = mask)
         
         return self.embedding_head(output, training = training, mask = mask, ** kwargs)
 
-    @timer
-    def call(self,
-             inputs,
-             mask   = None,
-             
-             training   = False,
-             
-             first_layer_idx    = -1,
-             last_layer_idx     = -1,
-             
-             ** kwargs
-            ):
-        image = inputs
-        if first_layer_idx == -1:
-            embedded = self.conv(image)
-            if self.conv_act is not None:   embedded = self.conv_act(embedded)
-            if self.pooling is not None:    embedded = self.pooling(embedded)
-            embedded = tf.reshape(embedded, [tf.shape(embedded)[0], -1, tf.shape(embedded)[-1]])
-            
-            embedded = tf.concat([
-                tf.broadcast_to(
-                    self.class_embedding, [tf.shape(embedded)[0], 1, tf.shape(embedded)[-1]]
-                ),
-                embedded
-            ], axis = 1)
-            embedded = embedded + tf.expand_dims(self.positional_embedding, axis = 0)
-            if self.conv_norm is not None:  embedded = self.conv_norm(embedded, training = training)
-            if self.conv_drop is not None:  embedded = self.conv_drop(embedded, training = training)
-        else:
-            embedded = inputs
+    def prepare_input(self, inputs, training = False, mask = None, ** kwargs):
+        embedded = self.conv(inputs)
+        if self.conv_act is not None:   embedded = self.conv_act(embedded)
+        if self.pooling is not None:    embedded = self.pooling(embedded)
+        embedded = tf.reshape(embedded, [tf.shape(embedded)[0], -1, tf.shape(embedded)[-1]])
         
-        outputs = super().call(
-            embedded, mask = mask, training = training,
-            first_layer_idx = first_layer_idx, last_layer_idx = last_layer_idx, ** kwargs
+        embedded = tf.concat([
+            tf.broadcast_to(
+                self.class_embedding, [tf.shape(embedded)[0], 1, tf.shape(embedded)[-1]]
+            ),
+            embedded
+        ], axis = 1)
+        embedded = embedded + tf.expand_dims(self.positional_embedding, axis = 0)
+        if self.conv_norm is not None:  embedded = self.conv_norm(embedded, training = training)
+        if self.conv_drop is not None:  embedded = self.conv_drop(embedded, training = training)
+        
+        embedded._keras_mask = tf.ones((tf.shape(embedded)[0], tf.shape(embedded)[1]), dtype = tf.bool)
+        return embedded
+    
+    def transfer_weights(self, pretrained, ** kwargs):
+        from models.weights_converter import (
+            _transformer_patterns, _attn_split, name_based_partial_transfer_learning
         )
-        if last_layer_idx != -1: return outputs
-        
-        if not isinstance(outputs, (list, tuple, TransformerOutput)): outputs = (outputs, )
-        output = outputs[0]
 
-        logits = self.compute_output(
-            output, training = training, mask = mask, image = image, ** kwargs
+        kwargs.setdefault('transforms', _attn_split)
+
+        if isinstance(pretrained, dict):
+            pretrained = {k : v for k, v in pretrained.items() if 'visual' in k}
+        
+        return name_based_partial_transfer_learning(
+            self, pretrained, skip_root = False, patterns = {
+                ** _transformer_patterns, 'norm_pre' : 'transformer/norm_conv'
+            }, ** kwargs
         )
-        
-        if isinstance(outputs, TransformerOutput):
-            return TransformerOutput(logits, * outputs[1:])
-        elif len(outputs) > 1:
-            return (logits, ) + outputs[1:]
-        return logits
-        
-        
+
     @classmethod
     def from_pretrained(cls, pretrained_name = 'RN50', pretrained = None,** kwargs):
         from custom_architectures.clip_arch import load_clip
@@ -189,45 +164,15 @@ class VisualTransformer(TransformerEncoder):
             
             embedding_dim   = embedding_dim,
             num_layers      = num_layers,
-            mha_num_heads  = embedding_dim // 64,
-            ffn_dim        = embedding_dim * 4
+            mha_num_heads   = embedding_dim // 64,
+            ffn_dim         = embedding_dim * 4
         )
         with tf.device('cpu'):
             instance = cls(** config(** kwargs))
             instance._build()
 
-        for i in range(num_layers):
-            weights     = get_pt_variables(get_pt_layers({
-                k : w for k, w in state_dict.items()
-                if k.startswith('visual.transformer.resblocks.{}.'.format(i))
-            }))
-            new_weights = []
-            for w, b in zip(np.split(weights[0], 3, axis = -1), np.split(weights[1], 3)):
-                new_weights += [w, b]
-            new_weights += weights[2:]
-
-            instance._layers[i].set_weights(new_weights)
-
-        instance.conv.set_weights([
-            transpose_weights(state_dict['visual.conv1.weight'].detach().numpy())
-        ])
-        instance.class_embedding.assign(
-            state_dict['visual.class_embedding'].detach().numpy()
-        )
-        instance.positional_embedding.assign(
-            state_dict['visual.positional_embedding'].detach().numpy()
-        )
-        instance.conv_norm.set_weights([
-            state_dict['visual.ln_pre.weight'].detach().numpy(),
-            state_dict['visual.ln_pre.bias'].detach().numpy()
-        ])
-        instance.out_norm.set_weights([
-            state_dict['visual.ln_post.weight'].detach().numpy(),
-            state_dict['visual.ln_post.bias'].detach().numpy()
-        ])
-        instance.embedding_head.final_dense.set_weights([
-            state_dict['visual.proj'].detach().numpy()
-        ])
+        instance.transfer_weights(state_dict, ** kwargs)
+        
         return instance
 
 custom_functions    = {

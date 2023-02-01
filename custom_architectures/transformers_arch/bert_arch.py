@@ -65,15 +65,14 @@ class BaseBERT(TextTransformerEncoder):
 
         self.pooler = BertPooler(** self.hparams, name = "pooler") if self.hparams.use_pooling else None
     
-    def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
-        return (encoder_outputs, pooled_outputs)
-    
     def compute_output(self, output, training = False, mask = None, ** kwargs):
+        output = super().compute_output(
+            output, training = training, mask = mask, ** kwargs
+        )
+        
         pooled_output = self.pooler(output) if self.pooler is not None else None
 
-        return self.process_outputs(
-            output, pooled_output, mask = mask, training = training
-        )
+        return (output, pooled_output)
 
     @classmethod
     def from_pretrained(cls,
@@ -131,22 +130,22 @@ class BertMLM(BaseBERT):
             shape = [self.hparams.vocab_size], initializer = "zeros", trainable = True, name = "bias"
         )
         
-    def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
-        outputs = self.dense(encoder_outputs, training = training)
-        if self.act is not None: outputs = self.act(outputs)
-        outputs = self.norm(outputs, training = training and self.hparams.norm_training)
+    def compute_output(self, output, mask = None, training = False, ** kwargs):
+        output, _ = super().compute_output(output, mask = mask, training = training, ** kwargs)
         
-        outputs = self.embeddings.linear(outputs) + self.bias
+        output = self.dense(output)
+        if self.act is not None: output = self.act(output)
+        output = self.norm(output, training = training and self.norm_training)
         
-        return outputs
+        return self.embeddings.linear(output) + self.bias
 
 class BertClassifier(BaseBERT):
     default_params  = HParamsBertClassifier
-    _attr_to_set    = BaseBERT._attr_to_set + ['process_tokens']
+    _attr_to_set    = BaseBERT._attr_to_set + ['process_tokens', 'process_first_token']
     
     def __init__(self, num_classes, vocab_size, embedding_dim, ** kwargs):
         super().__init__(
-            vocab_size = vocab_size, embedding_dim = embedding_dim, ** kwargs
+            vocab_size = vocab_size, embedding_dim = embedding_dim, num_classes = num_classes, ** kwargs
         )
         
         self.classifier = _get_layer(
@@ -156,11 +155,15 @@ class BertClassifier(BaseBERT):
         self.act        = get_activation(self.hparams.final_activation)
         self.dropout    = tf.keras.layers.Dropout(self.hparams.final_drop_rate)
         
-    def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
-        if self.process_tokens:
-            output = encoder_outputs if not self.hparams.process_first_token else encoder_outputs[:, 0, :]
-        else:
-            output = pooled_outputs
+    def compute_output(self, output, mask = None, training = False, ** kwargs):
+        output, pooled_out = super(BertClassifier, self).compute_output(
+            output, mask = mask, training = training, ** kwargs
+        )
+        
+        if not self.process_tokens:
+            output = pooled_out
+        elif self.process_first_token:
+            output = output[:, 0]
         
         if self.dropout is not None: output = self.dropout(output, training = training)
         output = self.classifier(output, training = training)
@@ -169,10 +172,10 @@ class BertClassifier(BaseBERT):
         return output
 
 class BertNSP(BertClassifier):
-    def __init__(self, vocab_size, embedding_dim, num_classes = 2, process_tokens = False, ** kwargs):
+    def __init__(self, vocab_size, embedding_dim, num_classes = 2, ** kwargs):
         kwargs.update({'use_pooling' : True, 'process_tokens' : False})
         super().__init__(
-            num_classes = num_classes, vocab_size = vocab_size, embedding_dim = embedding_dim, ** kwargs
+            num_classes = 2, vocab_size = vocab_size, embedding_dim = embedding_dim, ** kwargs
         )
     
 class BertEmbedding(BaseBERT):
@@ -184,11 +187,14 @@ class BertEmbedding(BaseBERT):
             vocab_size = vocab_size, embedding_dim = embedding_dim, output_dim = output_dim, ** kwargs
         )
         if 'process_first_token' in kwargs:
-            kwargs['token_selector'] = True if kwargs['process_first_token'] else None
+            kwargs['token_selector'] = 'first' if kwargs['process_first_token'] else None
         self.embedding_head = EmbeddingHead(** self.hparams)
 
-    def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
-        output = encoder_outputs if self.process_tokens else pooled_outputs
+    def compute_output(self, output, mask = None, training = False, ** kwargs):
+        output, pooled_out = super(BertEmbedding, self).compute_output(
+            output, mask = mask, training = training, ** kwargs
+        )
+        if not self.process_tokens: output = pooled_out
         
         return self.embedding_head(output, mask = mask, training = training)
 
@@ -197,10 +203,12 @@ class BertQA(BertClassifier):
         kwargs.update({'num_classes' : 2, 'process_tokens' : True, 'process_first_token' : False})
         super().__init__(* args, ** kwargs)
     
-    def process_outputs(self, encoder_outputs, pooled_outputs, mask = None, training = False):
-        output = super().process_outputs(encoder_outputs, pooled_outputs, mask = None, training = False)
+    def compute_output(self, output, mask = None, training = False, ** kwargs):
+        output = super().compute_output(
+            output, mask = mask, training = training, ** kwargs
+        )
 
-        probs   = tf.nn.softmax(output, axis = -1)
+        probs   = tf.nn.softmax(output, axis = 1)
         
         return probs[:, :, 0], probs[:, :, 1]
 

@@ -59,14 +59,25 @@ def load_clip(pretrained_name = 'RN50', pretrained = None, ** kwargs):
     
     return state_dict
 
-def CLIP(pretrained_name, pretrained = None, normalize = True,
-         distance_metric = 'dp', name = 'CLIP', ** kwargs):
+def CLIP(pretrained_name,
+         pretrained     = None,
+         normalize      = True,
+         distance_metric    = 'dp',
+         name = 'CLIP',
+         ** kwargs
+        ):
+    """
+        Builds a CLIP model as a `tf.keras.Model` instance
+        The input signature is :
+            - (input_dim, input_dim, 3) : for the input image (input_dim is determined by the pretrained model's input shape)
+            - (seq_len, ) with tf.int32 : for the input tokens
+    """
     from custom_architectures.simple_models import comparator
     from custom_architectures.modified_resnet_arch import from_clip_pretrained
-    from custom_architectures.transformers_arch import get_pretrained_transformer_encoder
+    from custom_architectures.transformers_arch.clip_text_encoder_arch import CLIPTextEncoder
     
     state_dict  = load_clip(pretrained_name, pretrained = pretrained)
-    
+
     kwargs.update({'output_normalize' : normalize})
     if 'rn' in pretrained_name.lower():
         visual_encoder  = from_clip_pretrained(
@@ -83,9 +94,11 @@ def CLIP(pretrained_name, pretrained = None, normalize = True,
         )
         input_dim   = visual_encoder.input_dim
 
-    text_encoder    = get_pretrained_transformer_encoder(
-        pretrained_name = pretrained_name, pretrained = state_dict, class_name = 'CLIPTextEncoder',
-        name = 'text_encoder', ** kwargs
+    text_encoder    = CLIPTextEncoder.from_pretrained(
+        pretrained_name = pretrained_name,
+        pretrained  = state_dict,
+        name    = 'text_encoder',
+        ** kwargs
     )
 
     clip   = comparator(
@@ -94,13 +107,12 @@ def CLIP(pretrained_name, pretrained = None, normalize = True,
         input_signature_a   = tf.TensorSpec(
             shape = (None, input_dim, input_dim, 3), dtype = tf.float32
         ),
-        input_signature_b   = [
-            tf.TensorSpec(shape = (None, None), dtype = tf.int32),
-            tf.TensorSpec(shape = (None, ), dtype = tf.int32)
-        ],
+        input_signature_b   = tf.TensorSpec(shape = (None, None), dtype = tf.int32),
         distance_metric = distance_metric,
         name    = name
     )
+    if hasattr(text_encoder, 'set_tokens'):
+        clip.set_tokens = text_encoder.set_tokens
     
     clip.layers[-1].set_weights([
         tf.reshape(state_dict['logit_scale'].exp().detach().numpy(), [1, 1]),

@@ -1,5 +1,7 @@
 # :yum: Siamese network
 
+**NEW : [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file ! Check it to have a global overview of the latest modifications !** :yum:
+
 ## Project structure
 
 ```bash

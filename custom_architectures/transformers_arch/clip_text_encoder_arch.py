@@ -27,15 +27,23 @@ class CLIPTextEncoder(BaseGPT2):
         
         self.embedding_head = EmbeddingHead(** self.hparams)
 
-    def compute_output(self, output, training = False, mask = None, ** kwargs):
+    def compute_output(self, output, training = False, mask = None, inputs = None, ** kwargs):
         output  = super().compute_output(output, training = training, mask = mask, ** kwargs)
-        
-        return self.embedding_head(output, training = training, mask = mask, ** kwargs)
+
+        return self.embedding_head(output, training = training, mask = mask, text = inputs)
+    
+    def transfer_weights(self, pretrained, ** kwargs):
+        from models.weights_converter import _attn_split
+
+        kwargs.setdefault(
+            'transforms', {** _attn_split, 'text_layer' : lambda k, v: {k : [vi.T for vi in v]}}
+        )
+
+        return super().transfer_weights(pretrained, ** kwargs)
 
     @classmethod
     def from_pretrained(cls, pretrained_name = 'RN50', pretrained = None,** kwargs):
         from custom_architectures.clip_arch import load_clip
-        from models.weights_converter import get_pt_variables, get_pt_layers
 
         state_dict = load_clip(pretrained_name, pretrained = pretrained)
         
@@ -62,29 +70,8 @@ class CLIPTextEncoder(BaseGPT2):
         instance = cls(** config(** kwargs))
         instance._build()
 
-        for i in range(num_layers):
-            weights     = get_pt_variables(get_pt_layers({
-                k : w for k, w in state_dict.items()
-                if k.startswith('transformer.resblocks.{}.'.format(i))
-            }))
-            new_weights = []
-            for w, b in zip(np.split(weights[0], 3, axis = -1), np.split(weights[1], 3)):
-                new_weights += [w, b]
-            new_weights += weights[2:]
+        instance.transfer_weights(state_dict, ** kwargs)
 
-            instance._layers[i].set_weights(new_weights)
-
-        instance.embeddings.set_weights([
-            state_dict['token_embedding.weight'].detach().numpy(),
-            state_dict['positional_embedding'].detach().numpy()
-        ])
-        instance.norm.set_weights([
-            state_dict['ln_final.weight'].detach().numpy(),
-            state_dict['ln_final.bias'].detach().numpy()
-        ])
-        instance.embedding_head.final_dense.set_weights([
-            state_dict['text_projection'].detach().numpy()
-        ])
         return instance
 
 _clip_objects   = {

@@ -23,7 +23,7 @@ from utils import get_enum_item
 from utils.sequence_utils import pad_to_multiple
 from custom_layers import FasterEmbedding
 from custom_architectures.transformers_arch.transformer_arch import Transformer, TransformerBlock, build_mask, format_output
-from custom_architectures.transformers_arch.bart_arch import Bart, BartEncoder, HParamsBart
+from custom_architectures.transformers_arch.bart_arch import Bart, BartEncoder
 from custom_architectures.transformers_arch.text_transformer_arch import *
 
 class SubsamplingMode(enum.IntEnum):
@@ -51,35 +51,65 @@ HParamsMAGWrapper = HParams(
 )
 
 @timer
+def pad_output_and_mask(output, mask, step):
+    output = pad_to_multiple(output, step, axis = 1)
+    if mask is not None:
+        mask = pad_to_multiple(mask, step, axis = -1)
+    
+    return output, mask
+
+@timer
+@tf.function(reduce_retracing = True)
 def concat_embeddings(embeddings,
                       mask      = None,
                       merge_embeddings  = False,
                       debug     = False,
                       ** kwargs
                      ):
-    question, contexts = embeddings[0], embeddings[1:]
-    q_mask, c_masks     = (mask[0], mask[1:]) if mask is not None else (None, None)
+    """
+        Concat multiple embeddings into a single embedding of shape [batch_size, total_seq_len, embedding_dim]
+        
+        Arguments :
+            - embeddings : list of `tf.Tensor`
+                - The 1st one (`embeddings[0]`) is considered as the `query` and must be of shape [B, q_len, embedding_dim]
+                - The others (`embeddings[1:]`) are considered as `contexts` and can be of shape :
+                    1) [batch_size, ci_len, embedding_dim]
+                    2) [batch_size, n_doc, ci_len, embedding_dim]
+                Note : if multiple `contexts` are given, they **must** be of the 1st shape
+    """
+    query, contexts = embeddings[0], embeddings[1:]
+    q_mask, c_masks = (mask[0], mask[1:]) if mask is not None else (None, None)
+
+    check_padding, is_real_mask = False, c_masks is not None
     
     c_lengths   = [tf.shape(c)[-2] for c in contexts]
     contexts    = tf.concat(contexts, axis = 1) if len(contexts) > 1 else contexts[0]
+    
+    n_doc_per_batch = 1
+    q_batch_size, c_batch_size = tf.shape(query)[0], tf.shape(contexts)[0]
+
     if c_masks is not None:
         if tf.shape(c_masks[0])[-2] > 1:
-            c_masks = tuple([tf.reduce_min(m, axis = -2, keepdims = True) for m in c_masks])
+            c_masks = tuple([tf.reduce_any(m, axis = -2, keepdims = True) for m in c_masks])
         c_masks = tf.concat(c_masks, axis = -1) if len(c_masks) > 1 else c_masks[0]
     if q_mask is not None and tf.shape(q_mask)[-2] > 1:
-        q_mask = tf.reduce_min(q_mask, axis = -2, keepdims = True)
+        q_mask = tf.reduce_any(q_mask, axis = -2, keepdims = True)
     
-    lengths     = [tf.shape(question)[1]] + c_lengths
+    if c_masks is None:
+        if len(tf.shape(contexts)) == 3:
+            c_masks = tf.ones((tf.shape(contexts)[0], 1, 1, tf.shape(contexts)[1]), dtype = tf.bool)
+        else:
+            c_masks = tf.ones((tf.shape(contexts)[0], tf.shape(contexts)[1], 1, 1, tf.shape(contexts)[2]), dtype = tf.bool)
+    if q_mask is None:
+        q_mask = tf.ones((q_batch_size, 1, 1, tf.shape(query)[1]), dtype = c_masks.dtype)
+
+    lengths     = [tf.shape(query)[1]] + c_lengths
     
     if debug:
         tf.print("Sequence lengths :", lengths)
         tf.print("1st input shape :", tf.shape(question))
         tf.print("2nd input shape :", tf.shape(contexts))
-        if c_masks is not None:
-            tf.print("Masks shape :", tf.shape(c_masks))
-    
-    n_doc_per_batch = 1
-    q_batch_size, c_batch_size = tf.shape(question)[0], tf.shape(contexts)[0]
+        tf.print("Masks shape :", tf.shape(c_masks))
     
     # flatten contexts from [B, n_doc, ctx_len, emb_dim] to [B, n_doc * ctx_len, emb_dim]
     if len(tf.shape(contexts)) == 4:
@@ -91,25 +121,12 @@ def concat_embeddings(embeddings,
         ctx_types = tf.repeat(tf.range(1, n_doc_per_batch + 1), tf.shape(contexts)[2])
         
         contexts    = tf.reshape(contexts, [c_batch_size, -1, tf.shape(contexts)[-1]])
-        if c_masks is not None:
-            c_masks = tf.reshape(c_masks, [c_batch_size, 1, 1, -1])
-
+        c_masks     = tf.reshape(c_masks, [c_batch_size, 1, 1, -1])
+        
+        check_padding = True
         if debug:
             tf.print("Contexts (after flattening) shape :", tf.shape(contexts))
-            if c_masks is not None:
-                tf.print("Masks (after flattening) shape :", tf.shape(c_masks))
-        
-        if c_masks is not None:
-            not_padding = tf.reduce_any(tf.reshape(c_masks, [c_batch_size, -1]) == 0, axis = 0)
-
-            contexts    = tf.boolean_mask(contexts, not_padding, axis = 1)
-            c_masks     = tf.boolean_mask(c_masks, not_padding, axis = 3)
-            ctx_types   = tf.boolean_mask(ctx_types, not_padding, axis = 0)
-            
-            if debug:
-                tf.print("# padding :", tf.reduce_sum(1 - tf.cast(not_padding, tf.int32)))
-                tf.print("Contexts (after removing padding) shape :", tf.shape(contexts))
-                tf.print("Masks (after removing padding) shape :", tf.shape(c_masks))
+            tf.print("Masks (after flattening) shape :", tf.shape(c_masks))
                 
     elif len(c_lengths) > 1:
         ctx_types   = tf.concat([
@@ -119,51 +136,62 @@ def concat_embeddings(embeddings,
         ctx_types   = tf.fill((tf.shape(contexts)[1], ), 1)
     
     # Merge contexts (if required)
-    if merge_embeddings and q_batch_size > 1 and q_batch_size == c_batch_size:
+    if merge_embeddings and q_batch_size > 1:
         if len(c_lengths) > 1:
             raise NotImplementedError("When merging contexts, you can only pass 1 context / batch !")
         
         ctx_add_type = tf.repeat(tf.range(q_batch_size), tf.shape(contexts)[1])
 
-        contexts = tf.reshape(
-            tf.tile(contexts, [c_batch_size, 1, 1]), 
-            [c_batch_size, -1, tf.shape(contexts)[-1]]
+        contexts  = tf.reshape(
+            tf.tile(contexts, [q_batch_size, 1, 1]), 
+            [q_batch_size, -1, tf.shape(contexts)[-1]]
         )
-        if c_masks is not None:
-            c_masks = tf.reshape(
-                tf.tile(c_masks, [c_batch_size, 1, 1, 1]), 
-                [c_batch_size, 1, 1, -1]
-            )
-        
+        ctx_types = tf.tile(ctx_types, [q_batch_size]) + n_doc_per_batch * ctx_add_type
+        c_masks   = tf.reshape(
+            tf.tile(c_masks, [q_batch_size, 1, 1, 1]), 
+            [q_batch_size, 1, 1, -1]
+        )
+        check_padding = True
         if debug:
             tf.print("Contexts (after merging) shape :", tf.shape(contexts))
-            if c_masks is not None:
-                tf.print("Masks (after merging) shape :", tf.shape(c_masks))
+            tf.print("Masks (after merging) shape :", tf.shape(c_masks))
         
-        ctx_types = tf.tile(ctx_types, [q_batch_size]) + n_doc_per_batch * ctx_add_type
+
+    if check_padding and is_real_mask:
+        not_padding = tf.reduce_any(tf.reshape(c_masks, [c_batch_size, -1]), axis = 0)
+
+        contexts    = tf.boolean_mask(contexts,  not_padding, axis = 1)
+        c_masks     = tf.boolean_mask(c_masks,   not_padding, axis = 3)
+        ctx_types   = tf.boolean_mask(ctx_types, not_padding, axis = 0)
         
-        if c_masks is not None:
-            not_padding = tf.reduce_any(tf.reshape(c_masks, [c_batch_size, -1]) == 0, axis = 0)
-
-            contexts    = tf.boolean_mask(contexts, not_padding, axis = 1)
-            c_masks     = tf.boolean_mask(c_masks, not_padding, axis = 3)
-            ctx_types   = tf.boolean_mask(ctx_types, not_padding, axis = 0)
-            
-            if debug:
-                tf.print("# padding :", tf.reduce_sum(1 - tf.cast(not_padding, tf.int32)))
-                tf.print("Contexts (after removing padding) shape :", tf.shape(contexts))
-                tf.print("Masks (after removing padding) shape :", tf.shape(c_masks))
-
+        if debug:
+            tf.print("# padding :", tf.reduce_sum(tf.cast(tf.logical_not(not_padding), tf.int32)))
+            tf.print("Contexts (after removing padding) shape :", tf.shape(contexts))
+            tf.print("Masks (after removing padding) shape :", tf.shape(c_masks))
     
-    types   = tf.concat([tf.fill([tf.shape(question)[1]], 0), ctx_types], axis = -1)
+    if q_batch_size != c_batch_size and q_batch_size > 1:
+        contexts = tf.tile(contexts, [q_batch_size, 1, 1])
+        c_masks  = tf.tile(c_masks, [q_batch_size, 1, 1, 1])
+
+    types   = tf.concat([tf.fill([tf.shape(query)[1]], 0), ctx_types], axis = -1)
     
-    memory  = tf.concat([question, contexts], axis = 1)
-    masks   = tf.concat([q_mask, c_masks], axis = -1) if q_mask is not None else None
+    memory  = tf.concat([query, contexts], axis = 1)
+    masks   = tf.concat([q_mask, c_masks], axis = -1)
     types   = tf.tile(tf.expand_dims(types, axis = 0), [q_batch_size, 1])
 
     return (memory, masks, types)
 
 class MAGModelWrapper(tf.keras.Model):
+    """
+        This class is a `wrapper`, meaning that it takes as argument a regular `TransformerBlock` model
+        Its objective is simply to modify the way data is given to the wrapped model by passing separately all inputs to the `M` first layers (named the `memory layers`), (possibly) subsample them, then concatenate them all, and finally pass the result to the `N` remaining layers (named the `embedding layers`)
+        
+        The benefit of this approach are multiple :
+        - There are no restriction on the total input size (for the positional encoding)
+        - It allows to reduce the memory impact of long inputs by subsampling (optional)
+        - It reduces the impact of padding by removing it after the concatenation
+        - It does not degrade performances (at least if trained with this strategy and with well-tuned parameters)
+    """
     default_params  = HParamsMAGWrapper
     _attr_to_set    = [
         'subsample_at', 'subsample_after', 'subsampling_mode', 'subsampling_step',
@@ -174,18 +202,19 @@ class MAGModelWrapper(tf.keras.Model):
         super().__init__(name = name)
         self.hparams    = self.default_params.extract(kwargs)
         
-        for config in self._attr_to_set:
-            setattr(self, config, self.hparams[config])
+        for attr_name in self._attr_to_set:
+            setattr(self, attr_name, self.hparams[attr_name])
         
         self.model  = model
         
-        for config in self.model._attr_to_set:
-            setattr(self, config, getattr(self.model, config))
+        for attr_name in self.model._attr_to_set:
+            setattr(self, attr_name, getattr(self.model, attr_name))
         
         layer_idx = self.subsample_at
         if layer_idx < 0: layer_idx = len(self.model._layers) + layer_idx
         if self.subsample_after: layer_idx += 1
         self.M = max(0, min(len(self.model._layers), layer_idx))
+        
         
         self.subsampling_layer  = None
         self.subsampling_drop_layer = tf.keras.layers.Dropout(
@@ -198,18 +227,25 @@ class MAGModelWrapper(tf.keras.Model):
             
             if self.subsampling_mode == SubsamplingMode.CONV:
                 self.subsampling_layer = tf.keras.layers.Conv1D(
-                    filters = self.embedding_dim, kernel_size = self.subsampling_step,
-                    strides = self.subsampling_step, padding = 'valid', name = 'subsampling_layer'
+                    filters     = self.embedding_dim,
+                    kernel_size = self.subsampling_step,
+                    strides     = self.subsampling_step,
+                    padding     = 'valid',
+                    name    = 'subsampling_layer'
                 )
             elif self.subsampling_mode == SubsamplingMode.SEPARABLE:
                 self.subsampling_layer = tf.keras.layers.SeparableConv1D(
-                    filters = self.embedding_dim, kernel_size = self.subsampling_step,
-                    strides = self.subsampling_step, padding = 'valid', name = 'subsampling_layer'
+                    filters     = self.embedding_dim,
+                    kernel_size = self.subsampling_step,
+                    strides     = self.subsampling_step,
+                    padding     = 'valid',
+                    name    = 'subsampling_layer'
                 )
             elif self.subsampling_mode == SubsamplingMode.DENSE:
                 self.subsampling_layer = tf.keras.layers.Dense(
-                    units = self.embedding_dim, name = 'subsampling_layer',
-                    kernel_initializer = self._mean_initializer
+                    units   = self.embedding_dim,
+                    name    = 'subsampling_layer',
+                    kernel_initializer  = self._mean_initializer
                 )
         
         if self.hparams.use_type_embedding:
@@ -225,36 +261,25 @@ class MAGModelWrapper(tf.keras.Model):
         w /= self.subsampling_step
         return tf.cast(w, dtype)
 
-    def _build(self):
-        self(self.dummy_inputs, training = False)
+    def _build(self, ** kwargs):
+        return self(self.dummy_inputs, ** kwargs)
 
     @property
-    def embedding_layers(self):
+    def memory_layers(self):
         return self.model._layers[: self.M]
     
     @property
-    def memory_layers(self):
+    def embedding_layers(self):
         return self.model._layers[self.M :]
     
     @property
     def dummy_inputs(self):
-        batch_size, q_seq_len, c_seq_len = 2, 16, 32
+        dummy_inputs    = self.model.dummy_inputs
+        multi_dummy_inputs = tf.nest.map_structure(
+            lambda inp: tf.expand_dims(inp, axis = 1), dummy_inputs
+        )
         
-        q_tokens    = tf.ones([batch_size, q_seq_len], dtype = tf.int32)
-        q_length    = tf.fill([batch_size, 1], q_seq_len)
-        
-        c_tokens    = tf.ones([batch_size, c_seq_len], dtype = tf.int32)
-        c_length    = tf.fill([batch_size, 1], c_seq_len)
-        
-        return [q_tokens, q_length, c_tokens, c_length]
-    
-    @timer
-    def pad_to_multiple(self, output, mask = None):
-        output = pad_to_multiple(output, self.subsampling_step, axis = 1)
-        if mask is not None:
-            mask = pad_to_multiple(mask, self.subsampling_step, axis = -1)
-        
-        return output, mask
+        return [dummy_inputs, multi_dummy_inputs]
 
     @timer
     def subsample(self, output, mask = None, training = False):
@@ -281,34 +306,28 @@ class MAGModelWrapper(tf.keras.Model):
 
                 mask = tf.gather(tf.squeeze(mask, [1, 2]), indices, batch_dims = 1)
                 mask = tf.reshape(mask, [tf.shape(output)[0], 1, 1, -1])
-        elif self.subsampling_mode == SubsamplingMode.DENSE:
-            output, mask = self.pad_to_multiple(output, mask)
-            
-            output = tf.reshape(
-                output, [tf.shape(output)[0], -1, self.subsampling_step * tf.shape(output)[-1]]
-            )
-            output = self.subsampling_layer(output)
-            
-            if mask is not None:
-                mask = tf.reshape(mask, [tf.shape(output)[0], 1, 1, -1, self.subsampling_step])
-                mask = tf.reduce_min(mask, axis = -1)
         else:
-            output, mask = self.pad_to_multiple(output, mask)
-            
-            output = tf.reshape(
-                output, [tf.shape(output)[0], -1, self.subsampling_step, tf.shape(output)[-1]]
-            )
+            output, mask = pad_output_and_mask(output, mask, self.subsampling_step)
             
             if mask is not None:
                 mask = tf.reshape(mask, [tf.shape(output)[0], 1, 1, -1, self.subsampling_step])
-                mask = tf.reduce_min(mask, axis = -1)
-            
-            if self.subsampling_mode == SubsamplingMode.MIN:
-                output = tf.reduce_min(output, axis = 2)
-            elif self.subsampling_mode == SubsamplingMode.MAX:
-                output = tf.reduce_max(output, axis = 2)
+                mask = tf.reduce_all(mask, axis = -1)
+
+            if self.subsampling_mode == SubsamplingMode.DENSE:
+                output = tf.reshape(
+                    output, [tf.shape(output)[0], -1, self.subsampling_step * tf.shape(output)[-1]]
+                )
+                output = self.subsampling_layer(output)
             else:
-                output = tf.reduce_mean(output, axis = 2)
+                output = tf.reshape(
+                    output, [tf.shape(output)[0], -1, self.subsampling_step, tf.shape(output)[-1]]
+                )
+                if self.subsampling_mode == SubsamplingMode.MIN:
+                    output = tf.reduce_min(output, axis = 2)
+                elif self.subsampling_mode == SubsamplingMode.MAX:
+                    output = tf.reduce_max(output, axis = 2)
+                else:
+                    output = tf.reduce_mean(output, axis = 2)
         
         return output, mask
 
@@ -327,149 +346,67 @@ class MAGModelWrapper(tf.keras.Model):
             )
             types = types + (random_offset * tf.cast(types > 0, tf.int32))
         
-        if debug:
-            tf.print("Types used :", types)
+        if debug: tf.print("Types used :", types)
         
         memory = memory + self.type_embedding_layer(types)
         
         return memory, types
     
     @timer
-    def embed(self,
-              inputs,
-              input_length  = None,
-              token_types   = None,
-              position_ids  = None,
-              
-              mask  = None,
-              training  = False,
-              padding_mask  = None,
-              look_ahead_mask   = None,
-              
-              positional_offset = -1,
-              force_not_subsampling = False,
-              
-              return_state       = False,
-              return_attention   = False,
-              return_hidden_states   = False,
-              return_mask        = False,
-              as_dict    = False,
-              
-              debug = False,
-              ** kwargs
-             ):
-        if return_state is None:            return_state = self.model.return_state
-        if return_attention is None:        return_attention = self.model.return_attention
-        if return_hidden_states is None:    return_hidden_states = self.model.return_hidden_states
-        if return_mask is None:             return_mask = self.model.return_mask
-        
-        if isinstance(inputs, (list, tuple)):
-            assert len(inputs) % 2 == 0
-            
-            if len(inputs) > 2:
-                force_not_subsampling = tf.convert_to_tensor(force_not_subsampling)
-                positional_offset     = tf.convert_to_tensor(positional_offset)
-                
-                if len(tf.shape(force_not_subsampling)) == 0:
-                    force_not_subsampling = tf.repeat(
-                        tf.expand_dims(force_not_subsampling, axis = 0), len(inputs) // 2
-                    )
-                if len(tf.shape(positional_offset)) == 0:
-                    positional_offset = tf.repeat(
-                        tf.expand_dims(positional_offset, axis = 0), len(inputs) // 2
-                    )
-                
-                embeddings      = ()
-                states          = () if return_state else None
-                attn_weights    = () if return_attention else None
-                hidden_states   = () if return_hidden_states else None
-                masks           = () if return_mask else None
-                
-                for i in range(0, len(inputs), 2):
-                    outputs_i = self.embed(
-                        inputs[i],
-                        input_length    = inputs[i+1],
-                        token_types     = token_types[i // 2] if token_types is not None else None,
-                        position_ids    = position_ids[i // 2] if position_ids is not None else None,
-                        
-                        training    = training,
-                        
-                        positional_offset   = positional_offset[i // 2],
-                        force_not_subsampling   = force_not_subsampling[i // 2],
-                        
-                        return_state    = return_state,
-                        return_attention    = return_attention,
-                        return_hidden_states    = return_hidden_states,
-                        return_mask = return_mask,
-                        as_dict = True,
-                        
-                        debug   = debug,
-                        ** kwargs
-                    )
-                    embeddings = embeddings + (outputs_i.output, )
-                    if return_state:
-                        states = states + (outputs_i.state, )
-                    if return_attention:
-                        attn_weights = attn_weights + (outputs_i.attention_weights, )
-                    if return_hidden_states:
-                        hidden_states = hidden_states + (outputs_i.hidden_states, )
-                    if return_mask:
-                        masks = masks + (outputs_i.mask, )
-                
-                return format_output(
-                    output  = embeddings,
-                    state   = states,
-                    attn_weights    = attn_weights,
-                    hidden_states   = hidden_states,
-                    mask        = masks,
-                    
-                    return_state    = return_state,
-                    return_attention    = return_attention,
-                    return_hidden_states    = return_hidden_states,
-                    return_mask = return_mask,
-                    as_dict = as_dict
-                )
-            
-            text, input_length = inputs
-        else:
-            text = inputs
+    def embed_memory(self,
+                     inputs,
 
-        if debug:
-            tf.print("Input tokens shape :", tf.shape(text), "-", input_length)
+                     mask  = None,
+                     training  = False,
+
+                     force_not_subsampling = False,
+                     
+                     as_dict    = True,
+
+                     debug = False,
+                     ** kwargs
+                    ):
+        if isinstance(inputs, (list, tuple)):
+            kwargs['force_not_subsampling'] = force_not_subsampling
+            
+            outputs = []
+            for i in range(len(inputs)):
+                outputs.append(self.embed_memory(
+                    inputs[i],
+                    
+                    mask    = mask[i] if mask is not None else None,
+                    training    = training,
+                    
+                    as_dict = True,
+                    
+                    debug   = debug,
+                    ** {k : v[i] if isinstance(v, list) else v for k, v in kwargs.items()}
+                ))
+            return tf.nest.map_structure(
+                lambda * args: args, * outputs
+            )
+
+        text = inputs
+
+        if debug: tf.print("Input tokens shape :", tf.shape(text), "-", input_length)
         
         batch_size = tf.shape(text)[0]
         n_doc_per_batch = -1
         if len(tf.shape(text)) == 3:
             n_doc_per_batch = tf.shape(text)[1]
             text            = tf.reshape(text, [-1, tf.shape(text)[-1]])
-            input_length    = tf.reshape(input_length, [-1])
             if debug:
                 tf.print("Input tokens reshaped shape :", tf.shape(text))
-        
-        if mask is None:
-            mask = build_mask(
-                text, self.use_causal_attention, input_length = input_length,
-                look_ahead_mask = look_ahead_mask, padding_mask = padding_mask
-            )
 
-        outputs = self.model.call(
+        outputs = self.model(
             text,
-            input_length = input_length,
-            token_types = token_types,
-            position_ids    = position_ids,
-            positional_offset   = positional_offset,
-            
             mask    = mask,
             training    = training,
+
+            first_layer_idx = -1,
+            last_layer_idx  = self.M,
             
-            last_layer_idx = self.M,
-            
-            return_state            = return_state,
-            return_attention        = return_attention,
-            return_hidden_states    = return_hidden_states,
-            return_mask = return_mask,
             as_dict = True,
-            
             debug   = debug,
             ** kwargs
         )
@@ -479,8 +416,7 @@ class MAGModelWrapper(tf.keras.Model):
         if not force_not_subsampling:
             output, mask = self.subsample(output, mask = mask, training = training)
 
-            if debug:
-                tf.print("Output subsampled shape :", tf.shape(output))
+            if debug: tf.print("Output subsampled shape :", tf.shape(output))
         
         if n_doc_per_batch != -1:
             output  = tf.reshape(
@@ -488,41 +424,42 @@ class MAGModelWrapper(tf.keras.Model):
             )
             mask    = tf.reshape(mask,   [batch_size, n_doc_per_batch, 1, 1, tf.shape(mask)[-1]])
 
-            if debug:
-                tf.print("Output reshaped shape :", tf.shape(output))
+            if debug: tf.print("Output reshaped shape :", tf.shape(output))
         
-        return format_output(
-            output,
+        return TransformerOutput(
+            output  = output,
             state   = outputs.state,
-            attn_weights    = outputs.attention_weights,
+            logits  = outputs.logits,
+            attention_weights   = outputs.attention_weights,
             hidden_states   = outputs.hidden_states,
-            mask    = mask,
-            
-            return_state        = return_state,
-            return_attention    = return_attention,
-            return_hidden_states    = return_hidden_states,
-            return_mask         = return_mask,
-            as_dict = as_dict
+            mask    = mask
         )
     
     @timer
-    def process_memory(self, embeddings, mask = None, training = False, ** kwargs):
+    def process_memory(self,
+                       embeddings,
+                       mask     = None,
+                       training = False,
+                       memory   = None,
+                       ** kwargs
+                      ):
+        if memory is not None: embeddings = [embeddings, memory]
         memory, mask, types = concat_embeddings(embeddings, mask = mask, training = training, ** kwargs)
         
         memory, types = self.embed_types(memory, types, training = training, ** kwargs)
         
-        return self.model.call(
+        return self.model(
             memory, first_layer_idx = self.M, training = training, padding_mask = mask, ** kwargs
         )
     
     @timer
     def call(self,
              inputs,
+             memory     = None,
              mask       = None,
              training   = False,
              
              merge_embeddings   = False,
-             positional_offset  = -1, 
              
              return_state       = False,
              return_attention   = False,
@@ -533,16 +470,24 @@ class MAGModelWrapper(tf.keras.Model):
              
              ** kwargs
             ):
-        if return_state is None:            return_state = self.model.return_state
-        if return_attention is None:        return_attention = self.model.return_attention
-        if return_hidden_states is None:    return_hidden_states = self.model.return_hidden_states
-        if return_mask is None:             return_mask = self.model.return_mask
-
-        memory_outputs = self.embed(
+        """
+            Computes the `MAG`-style prediction by :
+            1) encoding separately all `inputs` (with the `memory layers`)
+            2) (optional) subsampling all encoded `inputs`
+            3) Concatenating all the encoded (possibly subsampled) `inputs`
+            4) Passing all the concatenated result to the remaining `embedding layers`
+            
+            Arguments :
+                - inputs    : the input tokens
+                    - single `tf.Tensor`    : the `memory` argument must be given
+                    - list of `tf.Tensor`   : the list of inputs, the 1st is the `main` input while the others are considered as `memory` (i.e. the contextuals information)
+                - merge_embeddings  : whether to merge the *multi* input embeddings (i.e. the memory)
+                other arguments are equivalent to `TransformerBlock.call`
+        """
+        memory_outputs = self.embed_memory(
             inputs,
             mask    = mask,
             training    = training,
-            positional_offset   = positional_offset,
             
             return_state    = return_state,
             return_attention    = return_attention,
@@ -556,6 +501,7 @@ class MAGModelWrapper(tf.keras.Model):
 
         outputs = self.process_memory(
             embeddings,
+            memory  = memory,
             mask    = masks,
             training    = training,
             merge_embeddings    = merge_embeddings,
@@ -627,6 +573,10 @@ class MAGWrapper(tf.keras.Model):
         return self.model.dummy_inputs
     
     @property
+    def dummy_encoder_output(self):
+        return self.model.dummy_encoder_output
+    
+    @property
     def encoder(self):
         return self.model.encoder if isinstance(self.model, Transformer) else self.model
     
@@ -634,11 +584,11 @@ class MAGWrapper(tf.keras.Model):
     def decoder(self):
         return self.model.decoder if isinstance(self.model, Transformer) else None
     
-    def _build(self):
-        self(self.dummy_inputs, training = False)
+    def _build(self, ** kwargs):
+        return self(self.dummy_inputs, ** kwargs)
 
     def call(self, * args, ** kwargs):
-        return self.model.call(* args, ** kwargs)
+        return self.model(* args, ** kwargs)
     
     def infer(self, * args, ** kwargs):
         return self.model.infer(* args, ** kwargs)
@@ -656,7 +606,7 @@ class MAGWrapper(tf.keras.Model):
             class_conf.update(MAGWrapper.get_wrapper_kwargs())
 
             config['model'] = get_architecture(class_name, ** class_conf)
-            
+        
         return cls(** config)
 
     @classmethod
@@ -674,7 +624,7 @@ class MAGWrapper(tf.keras.Model):
             'encoder_wrapper'   : lambda encoder, ** kwargs: MAGModelWrapper(model = encoder, ** kwargs),
             'encoder_wrapper_params'    : HParamsMAGWrapper
         }
-        
+
 custom_objects  = {
     'MAG'   : MAGWrapper,
     'MAGWrapper'    : MAGWrapper,

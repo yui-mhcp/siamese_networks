@@ -34,6 +34,7 @@ class CLIP(BaseComparator, BaseImageModel, BaseTextModel):
                  image_normalization    = 'clip',
                  ** kwargs
                 ):
+        if pretrained: kwargs.setdefault('text_encoder', 'clip')
         self._init_image(
             input_size = input_size, image_normalization = image_normalization,
             resize_kwargs = resize_kwargs, ** kwargs
@@ -44,6 +45,8 @@ class CLIP(BaseComparator, BaseImageModel, BaseTextModel):
         kwargs.setdefault('normalize', True)
         kwargs.update({'distance_metric' : distance_metric, 'embed_distance' : embed_distance})
         super().__init__(pretrained = pretrained, ** kwargs)
+        
+        if hasattr(self.encoder_b, 'set_tokens'): self.encoder_b.set_tokens(** self.model_tokens)
     
     def build_encoder_image(self, embedding_dim = None, normalize = False, pretrained = None,
                             ** kwargs):
@@ -82,7 +85,8 @@ class CLIP(BaseComparator, BaseImageModel, BaseTextModel):
                     ** kwargs
                 }
             )
-        
+            self.input_size = self.comparator.input_shape[0][1:]
+    
     @property
     def encoder_image_input_signature(self):
         return self.image_signature
@@ -109,16 +113,13 @@ class CLIP(BaseComparator, BaseImageModel, BaseTextModel):
         elif isinstance(data, list):
             return [self.get_input_text(data_i, ** kwargs) for data_i in data]
         
-        encoded_text = self.tf_encode_text(data, ** kwargs)
-        
-        return encoded_text, len(encoded_text)
+        return self.tf_encode_text(data, ** kwargs)
     
     def augment_input_image(self, image, ** kwargs):
         return self.augment_image(image, ** kwargs)
     
     def augment_input_text(self, inp, ** kwargs):
-        tokens, length = inp
-        return self.augment_text(tokens, length, ** kwargs)
+        return self.augment_text(inp, ** kwargs)
 
     def preprocess_input_image(self, image):
         return self.preprocess_image(image)

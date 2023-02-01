@@ -39,6 +39,8 @@ class TextSiamese(BaseTextModel, SiameseNetwork):
         self.use_fixed_length_input = use_fixed_length_input
         
         super().__init__(** kwargs)
+        
+        if hasattr(self.encoder, 'set_tokens'): self.encoder.set_tokens(** self.model_tokens)
 
     def build_encoder(self, embedding_dim = 512, pretrained = 'bert-base-uncased', ** kwargs):
         """ Create a simple cnn architecture with default config fitted for MNIST """
@@ -68,38 +70,31 @@ class TextSiamese(BaseTextModel, SiameseNetwork):
         if self.truncate not in (None, False):
             encoded_text = truncate(encoded_text, self.max_input_length, keep_mode = self.truncate)
         
-        return encoded_text, len(encoded_text)
+        return encoded_text
     
     def filter_input(self, inp):
-        return inp[1] <= self.max_input_length
+        return tf.shape(inp)[-1] <= self.max_input_length
     
     def augment_input(self, inp):
-        tokens, length = inp
-        return self.augment_text(tokens, length)
+        return self.augment_text(inp)
     
     def concat(self, x_same, x_not_same):
-        x_same_txt, x_same_length = x_same
-        x_not_same_txt, x_not_same_length = x_not_same
-        
-        return (
-            concat_sequences(x_same_txt, x_not_same_txt, pad_value = self.blank_token_idx),
-            tf.concat([x_same_length, x_not_same_length], axis = 0)
-        )
+        return concat_sequences(x_same, x_not_same, pad_value = self.blank_token_idx),
     
     def get_dataset_config(self, ** kwargs):
         kwargs['padded_batch']  = True
         kwargs['pad_kwargs']    = {
             'padding_values' : (
-                (((self.blank_token_idx, 0), (self.blank_token_idx, 0)), 0),
-                (((self.blank_token_idx, 0), (self.blank_token_idx, 0)), 0)
+                ((self.blank_token_idx, self.blank_token_idx), 0),
+                ((self.blank_token_idx, self.blank_token_idx), 0)
             )
         }
         if self.use_fixed_length_input:
-            input_shape = self.encoder_input_signature[0].shape
+            input_shape = self.encoder_input_signature.shape
             kwargs['pad_kwargs'] = {
                 'padded_shapes' : (
-                    (((input_shape[1:], ()), (input_shape[1:], ())), ()),
-                    (((input_shape[1:], ()), (input_shape[1:], ())), ()),
+                    ((input_shape[1:], input_shape[1:]), ()),
+                    ((input_shape[1:], input_shape[1:]), ()),
                 )
             }
         

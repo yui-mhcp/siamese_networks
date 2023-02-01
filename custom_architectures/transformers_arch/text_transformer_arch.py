@@ -16,43 +16,39 @@ from loggers import timer
 from hparams import HParams
 from custom_layers import FasterEmbedding
 from custom_architectures.transformers_arch.transformer_arch import *
-from custom_architectures.transformers_arch.generation_utils import infer
+from custom_architectures.transformers_arch.generation_utils import infer as infer_method
+from custom_architectures.transformers_arch.transformer_arch import _get_state_length
 
 HParamsTransformerTokenEmbedding = HParams(
     vocab_size  = None,
     embedding_dim   = None,
     max_input_length    = None,
+    max_token_types     = 0,
+    
     scale_embedding     = False,
+    normalize_embeddings    = True,
+    
     repeat_position     = -1,
     positional_offset   = 0,
-    max_token_types     = 0,
-    normalize_embeddings    = True,
+
     norm_training   = True,
     epsilon     = 1e-6,
     drop_rate   = 0.1
 )
 
 _shared_config = [
-    'vocab_size', 'max_input_length', 'scale_embedding', 'positional_offset'
+    'vocab_size', 'sos_token', 'eos_token', 'pad_token', 'max_input_length',
+    'scale_embedding', 'normalize_embeddings', 'positional_offset'
 ]
 
 HParamsTextTransformerBlock = HParamsTransformerBlock(
     ** HParamsTransformerTokenEmbedding,
-    sos_token   = None,
-    eos_token   = None
+    sos_token   = -1,
+    eos_token   = -1,
+    pad_token   = 0
 )
 HParamsTextTransformerEncoder = HParamsTextTransformerBlock(** HParamsTransformerEncoder)
-HParamsTextTransformerDecoder = HParamsTextTransformerBlock(
-    ** HParamsTransformerDecoder, ignore_kwargs = True
-)
-
-HParamsTextTransformer  = HParamsTransformer(
-    ** HParamsTextTransformerEncoder.get_config(add_prefix = 'encoder'),
-    ** HParamsTextTransformerDecoder.get_config(add_prefix = 'decoder'),
-    ** {key : None for key in _shared_config},
-    sos_token   = None,
-    eos_token   = None
-)
+HParamsTextTransformerDecoder = HParamsTextTransformerBlock(** HParamsTransformerDecoder)
 
 class TransformerTokenEmbedding(tf.keras.layers.Layer):
     _attr_to_set = [
@@ -79,8 +75,9 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
             max_input_length    = max_input_length
         )
         
-        for key in self._attr_to_set:
-            setattr(self, key, tf.constant(self.hparams[key]))
+        self._max_input_length = self.hparams.max_input_length
+        for attr_name in self._attr_to_set:
+            setattr(self, attr_name, self.hparams[attr_name])
         
         self.embedding_factor = tf.math.sqrt(
             float(embedding_dim) if self.hparams.scale_embedding else 1.
@@ -118,26 +115,27 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
 
     @property
     def max_input_length(self):
-        return self.hparams.max_input_length + self.hparams.positional_offset
+        return self._max_input_length + self.positional_offset
 
     @property
     def use_token_type(self):
         return self.token_type_embedding_layer is not None
 
+    @timer
     def linear(self, output):
         batch_size, seq_len = tf.shape(output)[0], tf.shape(output)[1]
         
         logits = tf.reshape(output, [-1, self.embedding_dim])
-        logits = tf.matmul(logits, self.token_embedding_layer.embeddings, transpose_b = True)
+        logits = tf.matmul(
+            logits, tf.cast(self.token_embedding_layer.embeddings, logits.dtype), transpose_b = True
+        )
         logits = tf.reshape(logits, [batch_size, seq_len, self.vocab_size])
         
         return logits
 
     @timer
     def embed_tokens(self, text):
-        token_embedded = self.token_embedding_layer(text)
-        
-        return token_embedded * self.embedding_factor
+        return self.token_embedding_layer(text) * self.embedding_factor
     
     @timer
     def embed_token_types(self, token_types, batch_size, seq_len):
@@ -156,8 +154,12 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
                         seq_len,
                         positional_offset,
                         repeat_position,
+                        initial_state   = None,
                         debug = False
                        ):
+        if initial_state:
+            positional_offset += _get_state_length(initial_state)
+        
         if position_ids is None:
             if repeat_position > 1:
                 position_ids = tf.repeat(
@@ -170,8 +172,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
             if positional_offset > 0:
                 position_ids = position_ids + positional_offset
         
-        if debug:
-            tf.print("Position ids :", position_ids)
+        if debug: tf.print("Position ids :", position_ids)
         
         return self.pos_embedding_layer(position_ids)
     
@@ -181,6 +182,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
              input_length   = None,
              token_types    = None,
              position_ids   = None,
+             initial_state  = None,
              
              prefix     = None,
              training   = False,
@@ -220,7 +222,8 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
         
         # Embed positions 
         pos_embedded = self.embed_positions(
-            position_ids, tf.shape(token_embedded)[1], positional_offset, repeat_position, debug = debug
+            position_ids, tf.shape(token_embedded)[1], positional_offset, repeat_position,
+            initial_state = initial_state, debug = debug
         )
         
         if debug:
@@ -240,8 +243,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
         return tuple(inputs) + (self.embedding_dim, )
     
     def get_config(self):
-        config = super().get_config()
-        return (self.hparams + config).get_config()
+        return (self.hparams + super().get_config()).get_config()
 
 class TextTransformerBlock(TransformerBlock):
     """ Regular `TransformerBlock` with a `TransformerTokenEmbedding` layer applied on inputs """
@@ -256,18 +258,14 @@ class TextTransformerBlock(TransformerBlock):
         
         with tf.name_scope(self.name):
             self.sos_token   = tf.Variable(
-                self.hparams.sos_token if self.hparams.sos_token is not None else -1,
-                dtype       = tf.int32,
-                trainable   = False,
-                name        = 'sos_token'
+                self.hparams.sos_token, trainable = False, dtype = tf.int32, name = 'sos_token'
             )
             self.eos_token   = tf.Variable(
-                self.hparams.eos_token if self.hparams.eos_token is not None else -1,
-                dtype       = tf.int32,
-                trainable   = False,
-                name        = 'eos_token'
+                self.hparams.eos_token, trainable = False, dtype = tf.int32, name = 'eos_token'
             )
-
+            self.pad_token   = tf.Variable(
+                self.hparams.pad_token, trainable = False, dtype = tf.int32, name = 'pad_token'
+            )
     
     def _init_input_layers(self,
                            token_embedding = None,
@@ -275,7 +273,7 @@ class TextTransformerBlock(TransformerBlock):
                            ** kwargs
                           ):
         self.embeddings = TransformerTokenEmbedding(
-            token_embedding         = token_embedding,
+            token_embedding     = token_embedding,
             positional_embedding    = positional_embedding,
             name    = 'embeddings',
             ** self.hparams
@@ -291,132 +289,108 @@ class TextTransformerBlock(TransformerBlock):
     
     @property
     def dummy_inputs(self):
-        batch_size, seq_len = 2, 32
-        text = tf.ones([batch_size, seq_len], dtype = tf.int32)
-        text_length = tf.fill([batch_size, 1], seq_len)
-        
-        return [text, text_length]
+        return tf.expand_dims(tf.range(9), axis = 0)
     
-    def set_tokens(self, sos_token, eos_token):
-        self.hparams = self.hparams(sos_token = sos_token, eos_token = eos_token)
-        self.sos_token.assign(sos_token)
-        self.eos_token.assign(eos_token)
+    def set_tokens(self, sos_token = None, eos_token = None, pad_token = None):
+        if sos_token is not None: self.sos_token.assign(sos_token)
+        if eos_token is not None: self.eos_token.assign(eos_token)
+        if pad_token is not None: self.pad_token.assign(pad_token)
+
+        self.hparams.update({
+            'sos_token' : self.sos_token.numpy(),
+            'eos_token' : self.eos_token.numpy(),
+            'pad_token' : self.pad_token.numpy()
+        })
 
     def embed_tokens(self, tokens):
         return self.embeddings.embed_tokens(tokens)
     
-    def compute_output(self, output, training = False, mask = None, ** kwargs):
-        return output
-    
-    @timer(name = 'Text Transformer call')
-    def call(self,
-             inputs,
-             input_length   = None,
-             token_types    = None,
-             position_ids   = None,
+    def prepare_input(self,
+                      inputs,
+                      input_length  = None,
+                      token_types   = None,
+                      position_ids  = None,
+                      additional_inputs = [],
+                      initial_state = None,
+
+                      mask  = None,
+                      training  = False,
              
-             mask       = None,
-             training   = False,
-             padding_mask   = None,
-             
-             prefix     = None,
-             
-             first_layer_idx    = -1,
-             last_layer_idx     = -1,
-             
-             positional_offset  = -1,
-             repeat_position    = -1,
-             ** kwargs
-            ):
+                      prefix     = None,
+                      positional_offset  = -1,
+                      repeat_position    = -1,
+                      
+                      ** kwargs
+                     ):
         text = inputs
-        prefix_length = 0
-        if first_layer_idx == -1:
-            if isinstance(inputs, (list, tuple)):
-                text, input_length = inputs[:2]
-                if self.use_token_type:
-                    if len(inputs) > 2: token_types  = inputs[2]
-                    if len(inputs) > 3: position_ids = inputs[3]
-                else:
-                    if len(inputs) > 2: position_ids = inputs[2]
-
-            if prefix is not None:
-                prefix_length = tf.shape(prefix)[1]
-                if tf.reduce_all(text[:, 0] == self.sos_token):
-                    text = text[:, 1:]
-                    if input_length is not None: input_length = input_length - 1
-                    if padding_mask is not None: padding_mask = padding_mask[..., 1:]
-                if input_length is not None: input_length += prefix_length
-                if padding_mask is not None and tf.shape(padding_mask)[-1] == tf.shape(text)[1]:
-                    padding_mask = tf.concat([
-                        tf.zeros((tf.shape(text)[0], 1, 1, tf.shape(prefix)[1]), dtype = tf.float32),
-                        padding_mask
-                    ], axis = -1)
-            
-            embedded = self.embeddings(
-                text,
-                input_length    = input_length,
-                token_types     = token_types,
-                position_ids    = position_ids,
-                
-                prefix  = prefix,
-                
-                repeat_position = repeat_position,
-                positional_offset   = positional_offset,
-
-                training    = training,
-                mask    = mask,
-                ** kwargs
-            )
-        else:
-            embedded = inputs
+        if len(additional_inputs) > 0:
+            if self.use_token_type:
+                token_types     = additional_inputs[0]
+                if len(additional_inputs) > 1: position_ids    = additional_inputs[1]
+            else:
+                position_ids    = additional_inputs[0]
         
-        outputs = super().call(
-            embedded,
+        mask = build_padding_mask(
+            text, mask = mask, lengths = input_length, pad_value = self.pad_token, dtype = tf.bool
+        )
+        
+        if prefix is not None and _get_state_length(initial_state) == 0:
+            prefix_length = tf.shape(prefix)[1]
+            # maybe removes 'sos_token'
+            if tf.reduce_all(text[:, 0] == self.sos_token):
+                text = text[:, 1:]
+                if input_length is not None: input_length = input_length - 1
+                if mask is not None: mask = mask[..., 1:]
+            
+            if input_length is not None: input_length += prefix_length
+            if mask is not None and tf.shape(mask)[-1] == tf.shape(text)[1]:
+                mask = tf.concat([
+                    tf.ones((tf.shape(text)[0], 1, 1, prefix_length), dtype = mask.dtype), mask
+                ], axis = -1)
+        
+        embedded = self.embeddings(
+            text,
             input_length    = input_length,
+            token_types     = token_types,
+            position_ids    = position_ids,
+            initial_state   = initial_state,
             
-            mask    = mask,
+            prefix  = prefix,
+            
+            repeat_position = repeat_position,
+            positional_offset   = positional_offset,
+
             training    = training,
-            padding_mask    = padding_mask,
-            
-            first_layer_idx = first_layer_idx,
-            last_layer_idx  = last_layer_idx,
+            mask    = mask,
             ** kwargs
         )
-        if last_layer_idx != -1: return outputs
+        embedded._keras_mask = mask
         
-        if not isinstance(outputs, (list, tuple, TransformerOutput)): outputs = (outputs, )
-        decoder_outputs = outputs[0]
+        return embedded
 
-        if prefix_length > 0: decoder_outputs = decoder_outputs[:, prefix_length - 1:]
-        
-        logits = self.compute_output(
-            decoder_outputs, training = training, mask = mask, text = text, ** kwargs
+    def compute_output(self, output, training = False, mask = None, prefix = None, ** kwargs):
+        output = super(TextTransformerBlock, self).compute_output(
+            output, training = training, mask = mask, ** kwargs
         )
+        if prefix is not None and tf.shape(output)[1] >= tf.shape(prefix)[1]:
+            output = output[:, tf.shape(prefix)[1] - 1 :]
         
-        if isinstance(outputs, TransformerOutput):
-            return TransformerOutput(logits, * outputs[1:])
-        elif len(outputs) > 1:
-            return (logits, ) + outputs[1:]
-        return logits
-    
-    @timer
+        return output
+
     def infer(self, * args, ** kwargs):
-        return infer(self, * args, ** kwargs)
+        kwargs.setdefault('max_length', self.max_input_length)
+        return infer_method(self, * args, ** kwargs)
     
-    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
-        from models.weights_converter import (
-            _transformer_patterns, name_based_partial_transfer_learning
-        )
-
-        return name_based_partial_transfer_learning(
-            self, pretrained, patterns = _transformer_patterns, tqdm = tqdm
-        )
-
+    def transfer_weights(self, * args, ** kwargs):
+        kwargs.setdefault('skip_layers', ('sos_token', 'eos_token', 'pad_token'))
+        return super().transfer_weights(* args, ** kwargs)
+    
     def get_output_shape(self, inputs, * args, ** kwargs):
         return super().get_output_shape(
             self.embeddings.get_output_shape(inputs), * args, ** kwargs
         )
     
+
 class TextTransformerEncoder(TextTransformerBlock):
     default_params = HParamsTextTransformerEncoder
 
@@ -426,24 +400,25 @@ class TextTransformerDecoder(TextTransformerBlock):
 class TextTransformer(Transformer):
     encoder_class   = TextTransformerEncoder
     decoder_class   = TextTransformerDecoder
-    default_params  = HParamsTextTransformer
     _shared_keys    = Transformer._shared_keys + _shared_config
     
-    def __init__(self, vocab_size, embedding_dim, max_input_length,
-                 sos_token = None, eos_token = None, ** kwargs):
-        kwargs.update({'sos_token' : sos_token, 'eos_token' : eos_token})
-        if sos_token is not None:
-            kwargs.update({'decoder_sos_token' : sos_token, 'decoder_eos_token' : eos_token})
-
+    def __init__(self, vocab_size, embedding_dim, max_input_length, ** kwargs):
         super().__init__(
             vocab_size = vocab_size, embedding_dim = embedding_dim,
             max_input_length = max_input_length, ** kwargs
         )
-
-    @property
-    def dummy_inputs(self):
-        return self.encoder.dummy_inputs + self.decoder.dummy_inputs
-        
-    def set_tokens(self, sos_token, eos_token):
-        self.hparams = self.hparams(sos_token = sos_token, eos_token = eos_token)
-        self.decoder.set_tokens(sos_token, eos_token)
+    
+    def set_tokens(self, ** kwargs):
+        """
+            Call `set_tokens` on both the `encoder` and the `decoder`
+            If you want to specify custom tokens for encoder / decoder, simply prefix its name by `encoder_` (or `decoder_`)
+            For instance `set_tokens(encoder_pad_token = 0, pad_token = 1)` will set `pad_token` to 0 and 1 respectively for the encoder / decoder
+        """
+        if hasattr(self.encoder, 'set_tokens'):
+            self.encoder.set_tokens(** {
+                ** kwargs, ** {k[8:] : v for k, v in kwargs.items() if k.startswith('encoder_')}
+            })
+        if hasattr(self.decoder, 'set_tokens'):
+            self.decoder.set_tokens(** {
+                ** kwargs, ** {k[8:] : v for k, v in kwargs.items() if k.startswith('decoder_')}
+            })

@@ -28,11 +28,6 @@ HParamsBartDecoder  = HParamsTextTransformerDecoder(
     final_activation    = 'softmax',
 )
 
-HParamsBart     = HParamsTextTransformer(
-    ** HParamsBartEncoder.get_config(add_prefix = 'encoder'),
-    ** HParamsBartDecoder.get_config(add_prefix = 'decoder')
-)
-
 class BartEncoder(TextTransformerEncoder):
     default_params = HParamsBartEncoder
 
@@ -54,6 +49,7 @@ class BartEncoder(TextTransformerEncoder):
             positional_offset   = 2,
             scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon = 1e-5,
+            pad_token   = 1,
 
             num_layers  = pretrained.config.encoder_layers,
             ffn_dim     = pretrained.config.encoder_ffn_dim,
@@ -96,11 +92,12 @@ class BartDecoder(TextTransformerDecoder):
         self.final_act_layer    = get_activation(self.hparams.final_activation)
     
     @property
-    def output_last_dim(self):
+    def output_dim(self):
         return self.vocab_size
     
-    @timer
     def compute_output(self, output, apply_softmax = True, ** kwargs):
+        output = super().compute_output(output, ** kwargs)
+        
         output = self.embeddings.linear(output) + self.final_bias
         if self.final_act_layer is not None and apply_softmax:
             output = self.final_act_layer(output)
@@ -126,6 +123,7 @@ class BartDecoder(TextTransformerDecoder):
             scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon     = 1e-5,
             sos_token   = 0,
+            pad_token   = 1,
             eos_token   = 2,
 
             num_layers  = pretrained.config.decoder_layers,
@@ -145,7 +143,6 @@ class BartDecoder(TextTransformerDecoder):
 class Bart(TextTransformer):
     encoder_class   = BartEncoder
     decoder_class   = BartDecoder
-    default_params  = HParamsBart
     
     def __init__(self, vocab_size, embedding_dim, max_input_length,
                  ** kwargs):
@@ -180,6 +177,7 @@ class Bart(TextTransformer):
             scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon     = 1e-5,
             sos_token   = 0,
+            pad_token   = 1,
             eos_token   = 2,
 
             encoder_num_layers  = pretrained.config.encoder_layers,

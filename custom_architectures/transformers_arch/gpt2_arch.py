@@ -14,55 +14,51 @@
 
 import tensorflow as tf
 
-from custom_architectures.transformers_arch.text_transformer_arch import TextTransformerEncoder, HParamsTextTransformerEncoder
+from custom_architectures.transformers_arch.text_transformer_arch import (
+    TextTransformerEncoder, HParamsTextTransformerEncoder
+)
 
 HParamsBaseGPT2  = HParamsTextTransformerEncoder(
     use_causal_attention    = True,
     normalize_embeddings    = False,
     
+    epsilon = 1e-5,
     normalize   = 'middle',
-    ffn_dim     = 3072,
-    ffn_activation  = 'gelu_new',
-    mha_normalize   = False,
+    normalize_output    = True,
     mha_normalize_input = True,
-    mha_epsilon     = 1e-5,
-    epsilon     = 1e-5
+    mha_normalize   = False,
+    mha_epsilon = 1e-5,
+    
+    ffn_dim     = 3072,
+    ffn_activation  = 'gelu_new'
 )
 
 class BaseGPT2(TextTransformerEncoder):
     default_params  = HParamsBaseGPT2
-    
-    def __init__(self, vocab_size, embedding_dim, ** kwargs):
-        super().__init__(vocab_size = vocab_size, embedding_dim = embedding_dim, ** kwargs)
-        
-        self.norm       = tf.keras.layers.LayerNormalization(
-            epsilon = self.hparams.epsilon, name = 'norm_final'
-        )
 
-    def compute_output(self, output, training = False, mask = None, ** kwargs):
-        return self.norm(output, training = training and self.norm_training)
+    def transfer_weights(self, pretrained, transpose = False, ** kwargs):
+        from models.weights_converter import _attn_split
 
-    def transfer_weights(self, pretrained, tqdm = lambda x: x, ** kwargs):
-        from models.weights_converter import _transformer_patterns, _attn_split, name_based_partial_transfer_learning
+        kwargs.setdefault('transforms', _attn_split)
+        if transpose:
+            kwargs['transforms'] = {
+                ** kwargs['transforms'], '.*' : lambda k, v: {k : [vi.T for vi in v]}
+            }
+            
+        kwargs.setdefault('skip_root', True)
 
-        return name_based_partial_transfer_learning(
-            self, pretrained, patterns = _transformer_patterns,
-            transforms = {** _attn_split, '.*' : lambda k, v: {k : [vi.T for vi in v]}}, tqdm = tqdm, ** kwargs
-        )
+        return super().transfer_weights(pretrained, ** kwargs)
         
     @classmethod
     def from_pretrained(cls,
                         pretrained_name = 'gpt2',
                         pretrained_task = 'generation',
                         pretrained      = None,
-                        tqdm    = lambda x: x,
                         ** kwargs
                        ):
-        from models.weights_converter import partial_transfer_learning
-
         if pretrained is None:
             from transformers import TFGPT2Model
-            with tf.device('cpu') as d:
+            with tf.device('cpu'):
                 pretrained = TFGPT2Model.from_pretrained(pretrained_name)
 
         if isinstance(pretrained, dict):
@@ -94,20 +90,20 @@ class BaseGPT2(TextTransformerEncoder):
         instance = cls(** config(** kwargs))
         instance._build()
 
-        instance.transfer_weights(pretrained, tqdm = tqdm, ** kwargs)
+        instance.transfer_weights(pretrained, ** kwargs)
 
         return instance
 
 class GPT2(BaseGPT2):
     @property
-    def output_last_dim(self):
+    def output_dim(self):
         return self.vocab_size
     
     def compute_output(self, output, training = False, mask = None, ** kwargs):
         output = super().compute_output(output, training = training, mask = mask, ** kwargs)
-        
+
         return self.embeddings.linear(output)
-    
+
 custom_functions    = {
     'BaseGPT2'      : BaseGPT2,
     'GPT2'          : GPT2
