@@ -31,6 +31,8 @@ class SiameseGenerator(FileCacheGenerator):
                  
                  ** kwargs
                 ):
+        self.suffixes   = suffixes
+        
         super().__init__(
             dataset,
             id_column   = id_column,
@@ -38,7 +40,6 @@ class SiameseGenerator(FileCacheGenerator):
             processed_column    = processed_column,
             ** kwargs
         )
-        self.suffixes       = suffixes
         
         self.id_col_x   = self.id_column + self.suffixes[0]
         self.id_col_y   = self.id_column + self.suffixes[1]

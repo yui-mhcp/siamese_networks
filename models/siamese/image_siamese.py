@@ -15,6 +15,11 @@ from models.siamese.siamese_network import SiameseNetwork
 from models.interfaces.base_image_model import BaseImageModel
 
 class ImageSiamese(BaseImageModel, SiameseNetwork):
+    get_input   = BaseImageModel.get_image
+    augment_input   = BaseImageModel.augment_image
+    preprocess_input    = BaseImageModel.preprocess_image
+
+    
     def __init__(self, input_size, ** kwargs):
         self._init_image(input_size = input_size, ** kwargs)
         
@@ -59,15 +64,6 @@ class ImageSiamese(BaseImageModel, SiameseNetwork):
 
     def __str__(self):
         return super().__str__() + self._str_image()
-    
-    def get_input(self, data, ** kwargs):
-        return self.get_image(data)
-    
-    def augment_input(self, image):
-        return self.augment_image(image)
-    
-    def preprocess_input(self, image):
-        return self.preprocess_image(image)
     
     def get_config(self, * args, ** kwargs):
         config = super().get_config(* args, ** kwargs)
