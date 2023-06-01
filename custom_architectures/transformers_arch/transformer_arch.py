@@ -12,9 +12,12 @@
 
 """ Tensorflow 2.x implementation of the main Transformers' blocks """
 
+import json
 import logging
 import collections
 import tensorflow as tf
+
+from tensorflow.keras.models import model_from_json
 
 from loggers import timer
 from hparams import HParams
@@ -71,7 +74,9 @@ def _get_state_length(state):
         Therefore, taking `state[0][0]` either returns : `k[0]` or `k`.
         In both cases, the dimension `-2` is the expected sequence length, it is the easiest way to get the information without taking care of the possibly nested tuple
     """
-    return 0 if not state else tf.shape(next(iter(state.values()))[0][0])[-2]
+    if not state: return 0
+    flattened = tf.nest.flatten(state)
+    return tf.shape(flattened[0])[-2] if flattened[0] is not None else 0
 
 def build_padding_mask(seq, mask = None, lengths = None, pad_value = 0, maxlen = None, dtype = tf.bool):
     """
@@ -84,9 +89,9 @@ def build_padding_mask(seq, mask = None, lengths = None, pad_value = 0, maxlen =
         return tf.reshape(mask, [tf.shape(mask)[0], 1, 1, tf.shape(mask)[1]])
     
     if lengths is None:
-        if len(tf.shape(seq)) == 2:
+        if len(seq.shape) == 2:
             mask = tf.cast(tf.math.not_equal(seq, tf.cast(pad_value, seq.dtype)), dtype = dtype)
-        elif len(tf.shape(seq)) == 3:
+        elif len(seq.shape) == 3:
             mask = tf.cast(tf.reduce_any(seq != tf.cast(pad_value, seq.dtype), axis = -1), dtype)
         else:
             raise ValueError('Unsupported sequence shape : {}'.format(tf.shape(seq)))
@@ -121,7 +126,7 @@ def combine_masks(padding_mask, look_ahead_mask):
         return tf.logical_and(look_ahead_mask, padding_mask)
     return tf.minimum(look_ahead_mask, padding_mask)
 
-@timer
+#@timer
 def format_output(output,
                   state     = None,
                   logits    = None,
@@ -164,7 +169,7 @@ def format_output(output,
     
     return out[0] if not as_dict and len(out) == 1 else out
 
-@timer
+#@timer
 def build_mask(inputs,
                use_causal_attention,
                lengths  = None,
@@ -266,7 +271,8 @@ class TransformerLayer(tf.keras.layers.Layer):
             Note that the `epsilon` and `norm_training` are propagated to the MHA
         """
         super().__init__(name = name)
-        
+        self.supports_masking   = True
+
         self.hparams    = HParamsTransformerLayer.extract(kwargs)
         self.hparams    = self.hparams(
             embedding_dim   = embedding_dim,
@@ -307,7 +313,22 @@ class TransformerLayer(tf.keras.layers.Layer):
         attn_state = self.attention.get_initial_state(inputs, batch_size = batch_size, dtype = dtype)
         if self.enc_attention is None: return attn_state
         return (attn_state, self.enc_attention.get_initial_state(inputs, batch_size, dtype = dtype))
+    
+    def initialize_cache(self, inputs, encoder_output = None, only_cross_cache = False):
+        attn_state = self.attention.initialize_cache(
+            inputs, inputs, inputs
+        ) if not only_cross_cache else None
         
+        if self.enc_attention is not None:
+            enc_attn_state = None
+            if encoder_output is not None:
+                enc_attn_state = self.enc_attention.initialize_cache(
+                    inputs, encoder_output, encoder_output
+                )
+            return (attn_state, enc_attn_state)
+        
+        return attn_state
+    
     def compute_mask(self,
                      inputs,
                      mask   = None,
@@ -330,7 +351,7 @@ class TransformerLayer(tf.keras.layers.Layer):
             dtype   = dtype
         )
 
-    @timer(name = 'layer call')
+    #@timer(name = 'layer call')
     def call(self,
              inputs,
              input_length   = None,
@@ -368,9 +389,6 @@ class TransformerLayer(tf.keras.layers.Layer):
                 - output    : the layer output with same shape as input
                 - attention_weights : self-attention weights for each head of the MHA
         """
-        if self.normalize == 'before':
-            inputs = self.norm(inputs, training = training and self.norm_training)
-
         if mask is None:
             mask = self.compute_mask(
                 inputs,
@@ -380,9 +398,20 @@ class TransformerLayer(tf.keras.layers.Layer):
                 initial_state   = initial_state
             )
 
+        if self.normalize == 'before':
+            inputs = self.norm(inputs, training = training and self.norm_training)
+
+        time_logger.start_timer('self MHA call')
+
+        attn_state, enc_attn_state = None, None
+        if initial_state:
+            attn_state, enc_attn_state = initial_state if self.enc_attention is not None else (initial_state, None)
+            
         attn_outputs    = self.attention(
-            inputs, inputs, inputs, mask = mask, training = training,
-            initial_state   = initial_state if initial_state is None or self.enc_attention is None else initial_state[0],
+            inputs,
+            mask    = mask,
+            training    = training,
+            initial_state   = attn_state,
             return_attention    = return_attention,
             return_state    = return_state,
             normalize_kv    = True
@@ -390,14 +419,21 @@ class TransformerLayer(tf.keras.layers.Layer):
         if not isinstance(attn_outputs, tuple): attn_outputs = (attn_outputs, )
         attn_out = attn_outputs[0]
         
+        time_logger.stop_timer('self MHA call')
+
         if self.enc_attention is not None:
             if encoder_output is None:
                 raise RuntimeError("You must provide encoder output when using encoder attention !")
             
+            time_logger.start_timer('cross MHA call')
+
             enc_attn_outputs = self.enc_attention(
-                attn_out, encoder_output, encoder_output, mask = enc_padding_mask,
-                initial_state   = initial_state[1] if initial_state is not None else None,
+                attn_out,
+                encoder_output,
+                encoder_output,
+                mask    = enc_padding_mask,
                 training    = training,
+                initial_state   = enc_attn_state,
                 return_attention    = return_attention,
                 return_state    = return_state,
                 normalize_kv    = False
@@ -407,11 +443,14 @@ class TransformerLayer(tf.keras.layers.Layer):
                 attn_out    = enc_attn_outputs[0]
                 attn_outputs    = tuple((o1, o2) for o1, o2 in zip(attn_outputs, enc_attn_outputs))
         
+            time_logger.stop_timer('cross MHA call')
+
         elif encoder_output is not None:
             raise RuntimeError(
                 "You cannot pass `encoder_output` when `self.use_encoder_attention` is False !"
             )
-        
+        time_logger.start_timer('MLP call')
+
         ffn_in = attn_out
         if self.normalize == 'middle':
             ffn_in = self.norm(ffn_in, training = training and self.norm_training)
@@ -424,6 +463,8 @@ class TransformerLayer(tf.keras.layers.Layer):
         if self.normalize == 'after':
             output = self.norm(output, training = training and self.norm_training)
         
+        time_logger.stop_timer('MLP call')
+
         return output if len(attn_outputs) == 1 else ((output,) + attn_outputs[1:])
     
     def get_output_shape(self,
@@ -529,6 +570,11 @@ class TransformerBlock(tf.keras.Model):
             layer.name : layer.get_initial_state(inputs, batch_size, dtype) for layer in self._layers
         }
     
+    def initialize_cache(self, * args, ** kwargs):
+        return {
+            layer.name : layer.initialize_cache(* args, ** kwargs) for layer in self._layers
+        }
+
     def prepare_input(self,
                       inputs,
                       input_length  = None,
@@ -547,7 +593,7 @@ class TransformerBlock(tf.keras.Model):
         
         return output
     
-    @timer(name = 'Transformer block call')
+    #@timer(name = 'Transformer block call')
     def call(self,
              inputs,
              input_length   = None,
@@ -598,6 +644,7 @@ class TransformerBlock(tf.keras.Model):
         
         output = inputs
         if first_layer_idx == -1:
+            first_layer_idx = 0
             output = self.prepare_input(
                 output,
                 input_length    = input_length,
@@ -618,7 +665,6 @@ class TransformerBlock(tf.keras.Model):
             initial_state   = initial_state
         )
 
-        first_layer_idx = max(first_layer_idx, 0)
         for i, layer in enumerate(self._layers[first_layer_idx : last_layer_idx], start = first_layer_idx):
             output, state, attn_weights = layer(
                 output,
@@ -768,14 +814,20 @@ class Transformer(tf.keras.Model):
                  name = None,
                  shared_layers = {},
                  
+                 encoder    = None,
                  encoder_wrapper = None,
                  encoder_wrapper_params = None,
+                 decoder    = None,
                  decoder_wrapper = None,
                  decoder_wrapper_params = None,
                  
                  ** kwargs
                 ):
         super().__init__(name = name)
+        
+        if encoder is not None: self.encoder_class = encoder.__class__
+        if decoder is not None: self.decoder_class = decoder.__class__
+            
         # Init the default parameters`
         default_params  = self.default_params
         # Maybe adds parameters for wrappers (if any)
@@ -802,13 +854,17 @@ class Transformer(tf.keras.Model):
             setattr(self, attr_name, self.hparams[attr_name])
         
         # Effectively builds the encoder and decoder classes (with possible wrappers)
-        self.encoder    = encoder_wrapper(self.encoder_class(
-            ** self.hparams.get_config(prefix = 'encoder'), ** shared_layers, name = 'encoder'
-        ), ** self.hparams.get_config(prefix = 'encoder'))
+        if encoder is None:
+            encoder = self.encoder_class(
+                ** self.hparams.get_config(prefix = 'encoder'), ** shared_layers, name = 'encoder'
+            )
+        self.encoder    = encoder_wrapper(encoder, ** self.hparams.get_config(prefix = 'encoder'))
         
-        self.decoder    = decoder_wrapper(self.decoder_class(
-            ** self.hparams.get_config(prefix = 'decoder'), ** shared_layers, name = 'decoder'
-        ), ** self.hparams.get_config(prefix = 'decoder'))
+        if decoder is None:
+            decoder = self.decoder_class(
+                ** self.hparams.get_config(prefix = 'decoder'), ** shared_layers, name = 'decoder'
+            )
+        self.decoder    = decoder_wrapper(decoder, ** self.hparams.get_config(prefix = 'decoder'))
     
     def _build(self, ** kwargs):
         if hasattr(self.encoder, 'dummy_inputs') and hasattr(self.decoder, 'dummy_inputs'):
@@ -850,7 +906,7 @@ class Transformer(tf.keras.Model):
             ** kwargs
         )
 
-    @timer(name = 'Transformer call')
+    #@timer(name = 'Transformer call')
     def call(self,
              inputs,
              input_length   = None,
@@ -938,7 +994,7 @@ class Transformer(tf.keras.Model):
             as_dict = as_dict
         )
     
-    @timer
+    #@timer(name = 'Transformer inference')
     def infer(self,
               inputs,
               input_length  = None,
@@ -990,10 +1046,24 @@ class Transformer(tf.keras.Model):
         )
     
     def get_config(self):
+        if type(self) is Transformer:
+            return {
+                'encoder'   : json.loads(self.encoder.to_json()),
+                'decoder'   : json.loads(self.decoder.to_json())
+            }
         return self.hparams.get_config()
-    
+
     @classmethod
     def from_config(cls, config, custom_objects = None):
+        if 'encoder' in config and 'decoder' in config:
+            config.update({
+                'encoder'   : model_from_json(
+                    json.dumps(config['encoder']), custom_objects = custom_objects
+                ),
+                'decoder'   : model_from_json(
+                    json.dumps(config['decoder']), custom_objects = custom_objects
+                )
+            })
         return cls(** config)
 
 custom_functions    = {

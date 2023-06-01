@@ -51,11 +51,12 @@ def get_shape_invariant(model,
                         
                         use_cache   = False,
                         return_attention    = False,
-                        return_last_attention   = False
+                        return_last_attention   = False,
+                        dtype   = tf.float32
                        ):
     def _nested_map(shape):
         if isinstance(shape[0], tuple): return tuple(_nested_map(s) for s in shape)
-        return tf.TensorSpec(shape = shape, dtype = tf.float32)
+        return tf.TensorSpec(shape = shape, dtype = dtype)
     
     out_shapes  = model.get_output_shape(
         (None, None),
@@ -67,7 +68,7 @@ def get_shape_invariant(model,
     )
     if return_attention or return_last_attention:
         attn_shapes = {
-            k : tf.TensorSpec(shape = v, dtype = tf.float32)
+            k : tf.TensorSpec(shape = v, dtype = dtype)
             for k, v in out_shapes.attention_weights.items()
         }
     
@@ -80,18 +81,18 @@ def get_shape_invariant(model,
         t               = tf.TensorSpec(shape = (),                 dtype = tf.int32),
         tokens          = tf.TensorSpec(shape = (None, None),       dtype = tf.int32),
         lengths         = tf.TensorSpec(shape = (None, 1),          dtype = tf.int32),
-        scores          = tf.TensorSpec(shape = (None, ),           dtype = tf.float32),
+        scores          = tf.TensorSpec(shape = (None, ),           dtype = dtype),
         last_tokens     = tf.TensorSpec(shape = (None, 1),          dtype = tf.int32),
         
         padding_mask    = tf.TensorSpec(shape = (None, 1, 1, None), dtype = tf.bool),
         finished        = tf.TensorSpec(shape = (None, ),           dtype = tf.bool),
         
-        logits          = tf.TensorSpec(shape = out_shapes.output,  dtype = tf.float32),
+        logits          = tf.TensorSpec(shape = out_shapes.output,  dtype = dtype),
         state           = state_shapes if use_cache else {},
         attention_weights   = attn_shapes if return_attention or return_last_attention else {}
     )
 
-@timer
+@timer(name = 'decoder inference')
 def infer(model, * args, method = 'greedy', ** kwargs):
     return get_object(
         _inference_methods, method, model, * args, ** kwargs
@@ -161,7 +162,9 @@ def _infer(self,
             logits, n = 1, temperature = temperature, dtype = tokens.dtype
         )
 
-        scores      = scores + tf.where(finished, 0., tf.gather(logits, next_token, batch_dims = 1))
+        scores      = scores + tf.where(
+            finished, tf.cast(0., logits.dtype), tf.gather(logits, next_token, batch_dims = 1)
+        )
 
         tokens      = tf.concat([
             tokens, tf.expand_dims(next_token, axis = 1)
@@ -196,6 +199,8 @@ def _infer(self,
     
     skip_attention = not (return_attention or return_last_attention)
     
+    dtype = self.compute_dtype if encoder_output is None else encoder_output.dtype
+
     if batch_size == -1:
         batch_size = _get_batch_size(tokens, encoder_output, prefix = prefix)
     
@@ -223,7 +228,8 @@ def _infer(self,
         encoder_output  = encoder_output,
         return_attention    = return_attention,
         return_last_attention   = return_last_attention,
-        use_cache   = use_cache
+        use_cache   = use_cache,
+        dtype   = dtype
     )
     outputs = tf.nest.map_structure(tf.stop_gradient, tf.while_loop(
         cond    = cond,
@@ -233,15 +239,16 @@ def _infer(self,
             tokens  = tokens,
             lengths = input_length,
             last_tokens     = tokens[:, -1:],
-            scores      = tf.zeros((batch_size, ), dtype = tf.float32),
+            scores      = tf.zeros((batch_size, ), dtype = dtype),
             
             padding_mask    = padding_mask,
             finished    = tf.zeros((batch_size,), dtype = tf.bool),
             
-            logits      = tf.zeros((batch_size, 1, shapes_invariant.logits.shape[-1])),
-            state       = tf.nest.map_structure(
-                lambda sign: tf.zeros(shape = _fix_shape(sign.shape, batch_size), dtype = sign.dtype),
-                shapes_invariant.state
+            logits      = tf.zeros(
+                (batch_size, 1, shapes_invariant.logits.shape[-1]), dtype = dtype
+            ),
+            state       = self.initialize_cache(
+                tf.zeros((batch_size, 0, self.embedding_dim), dtype = dtype), encoder_output
             ) if use_cache else {},
             attention_weights   = tf.nest.map_structure(
                 lambda sign: tf.zeros(shape = _fix_shape(sign.shape, batch_size), dtype = sign.dtype),
@@ -333,7 +340,7 @@ def _infer_beam_search(self,
         
         reshaped_logits  = logits_with_scores
         if length_power != 0.:
-            reshaped_logits  = reshaped_logits / tf.cast(lengths, tf.float32) ** length_power
+            reshaped_logits  = reshaped_logits / tf.cast(lengths, logits.dtype) ** length_power
         
         reshaped_logits = tf.reshape(reshaped_logits, [batch_size, -1])
         
@@ -401,6 +408,13 @@ def _infer_beam_search(self,
     
     skip_attention  = not return_attention and not return_last_attention
     
+    if encoder_output is not None:
+        dtype = encoder_output.dtype
+    elif prefix is not None:
+        dtype = prefix.dtype
+    else:
+        dtype = tf.float32
+    
     if batch_size == -1:
         batch_size = _get_batch_size(tokens, encoder_output, prefix = prefix)
     
@@ -443,7 +457,7 @@ def _infer_beam_search(self,
     n_init          = tf.shape(tokens)[1]
     batch_idx_add   = tf.repeat(tf.range(batch_size), num_beams, axis = 0) * num_beams
     eos_mask        = tf.tensor_scatter_nd_update(
-        tf.fill((1, self.vocab_size), tf.float32.min), [[0, self.eos_token]], [0.]
+        tf.fill((1, self.vocab_size), dtype.min), [[0, self.eos_token]], [0.]
     )
 
     shapes_invariant    = get_shape_invariant(
@@ -451,7 +465,8 @@ def _infer_beam_search(self,
         encoder_output  = encoder_output,
         return_attention    = return_attention,
         return_last_attention   = return_last_attention,
-        use_cache   = use_cache
+        use_cache   = use_cache,
+        dtype   = dtype
     )
     outputs = tf.nest.map_structure(tf.stop_gradient, tf.while_loop(
         cond    = cond,
@@ -461,12 +476,14 @@ def _infer_beam_search(self,
             tokens  = tokens,
             lengths = input_length,
             last_tokens     = tokens[:, -1:],
-            scores      = tf.zeros((effective_batch_size, ), dtype = tf.float32),
+            scores      = tf.zeros((effective_batch_size, ), dtype = dtype),
             
             padding_mask    = padding_mask,
             finished    = tf.zeros((effective_batch_size,), dtype = tf.bool),
             
-            logits      = tf.zeros((effective_batch_size, 1, shapes_invariant.logits.shape[-1])),
+            logits      = tf.zeros(
+                (effective_batch_size, 1, shapes_invariant.logits.shape[-1]), dtype = dtype
+            ),
             state       = tf.nest.map_structure(
                 lambda sign: tf.zeros(_fix_shape(sign.shape, effective_batch_size), dtype = sign.dtype),
                 shapes_invariant.state
@@ -482,8 +499,8 @@ def _infer_beam_search(self,
     
     scores  = outputs.scores
     if length_power != 0:
-        lengths = tf.cast(tf.squeeze(outputs.input_length, axis = 1), tf.float32)
-        scores  = outputs.scores / (lengths ** length_power)
+        lengths = tf.cast(tf.squeeze(outputs.input_length, axis = 1), scores.dtype)
+        scores  = scores / (lengths ** length_power)
     
     attn_weights = outputs.attention_weights
     if not skip_attention:
@@ -530,13 +547,13 @@ def _compute_logits(scores,
         scores = scores / temperature
     
     if length_temperature != 0.:
-        lengths = tf.cast(lengths + 1, tf.float32)
+        lengths = tf.cast(lengths + 1, scores.dtype)
         
-        scores = scores * (tf.cast(lengths + 1, tf.float32) ** length_temperature)
+        scores = scores * (tf.cast(lengths + 1, scores.dtype) ** length_temperature)
     
     if logits_filter is not None:
         #tf.print('Scores (before filter) :', scores)
-        scores = logits_filter(scores, ** kwargs)
+        scores = tf.cast(logits_filter(tf.cast(scores, tf.float32), ** kwargs), scores.dtype)
         #tf.print('Scores (after filter)  :', scores)
 
     return log_softmax(scores, axis = -1)

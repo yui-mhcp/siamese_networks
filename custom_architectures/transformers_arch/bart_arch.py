@@ -91,6 +91,12 @@ class BartDecoder(TextTransformerDecoder):
         )
         self.final_act_layer    = get_activation(self.hparams.final_activation)
     
+    def change_vocabulary(self, vocab, ** kwargs):
+        super().change_vocabulary(vocab, ** kwargs)
+        self.final_bias = self.add_weight(
+            shape = [1, self.vocab_size], name = "final_bias", trainable = False, initializer = "zeros"
+        )
+        
     @property
     def output_dim(self):
         return self.vocab_size

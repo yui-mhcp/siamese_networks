@@ -113,6 +113,11 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
             self.hparams.drop_rate
         ) if self.hparams.drop_rate > 0. else None
 
+    def change_vocabulary(self, vocab, ** kwargs):
+        self.vocab_size = len(vocab)
+        self.hparams.vocab_size = len(vocab)
+        self.token_embedding_layer.change_vocabulary(vocab, ** kwargs)
+    
     @property
     def max_input_length(self):
         return self._max_input_length + self.positional_offset
@@ -279,6 +284,11 @@ class TextTransformerBlock(TransformerBlock):
             ** self.hparams
         )
     
+    def change_vocabulary(self, vocab, ** kwargs):
+        self.vocab_size = len(vocab)
+        self.hparams.vocab_size = len(vocab)
+        self.embeddings.change_vocabulary(vocab, ** kwargs)
+
     @property
     def max_input_length(self):
         return self.embeddings.max_input_length

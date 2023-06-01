@@ -74,7 +74,9 @@ def CLIP(pretrained_name,
     """
     from custom_architectures.simple_models import comparator
     from custom_architectures.modified_resnet_arch import from_clip_pretrained
-    from custom_architectures.transformers_arch.clip_text_encoder_arch import CLIPTextEncoder
+    from custom_architectures.transformers_arch.clip_encoders_arch import (
+        CLIPTextEncoder, CLIPImageEncoder
+    )
     
     state_dict  = load_clip(pretrained_name, pretrained = pretrained)
 
@@ -85,10 +87,9 @@ def CLIP(pretrained_name,
         )
         input_dim   = visual_encoder.input_shape[1]
     elif 'vit' in pretrained_name.lower():
-        visual_encoder  = get_pretrained_transformer_encoder(
+        visual_encoder  = CLIPImageEncoder.from_pretrained(
             pretrained_name = pretrained_name,
             pretrained  = state_dict,
-            class_name  = 'VisualTransformer',
             name = 'image_encoder',
             ** kwargs
         )

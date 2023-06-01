@@ -13,16 +13,18 @@
 
 import tensorflow as tf
 
-from custom_layers import get_activation, FasterEmbedding
+from custom_layers import get_activation
 from custom_architectures.current_blocks import _get_pooling_layer
-from custom_architectures.transformers_arch.embedding_head import HParamsEmbeddingHead, EmbeddingHead
 from custom_architectures.transformers_arch.transformer_arch import (
     HParamsTransformerEncoder, TransformerEncoder
 )
 
 HParamsVisualTransformer  = HParamsTransformerEncoder(
-    ** HParamsEmbeddingHead(token_selector = 'first'),
     input_dim   = -1,
+    input_channels  = 3,
+    add_row_embedding   = False,
+    add_col_embedding   = False,
+    add_class_embedding = False,
     
     filters = -1,
     kernel_size = 3,
@@ -52,21 +54,22 @@ HParamsVisualTransformer  = HParamsTransformerEncoder(
 
 class VisualTransformer(TransformerEncoder):
     default_params  = HParamsVisualTransformer
-    _attr_to_set    = TransformerEncoder._attr_to_set + ['input_dim']
+    _attr_to_set    = TransformerEncoder._attr_to_set + [
+        'input_dim', 'add_class_embedding', 'add_row_embedding', 'add_col_embedding'
+    ]
     
     def __init__(self, input_dim, embedding_dim, ** kwargs):
         super().__init__(
             input_dim = input_dim, embedding_dim = embedding_dim, ** kwargs
         )
-        
-        self.embedding_head = EmbeddingHead(** self.hparams, name = 'embedding_layer')
     
     def _init_input_layers(self, ** kwargs):
+        strides = self.hparams.strides if self.hparams.strides != -1 else self.hparams.filters
         self.conv   = tf.keras.layers.Conv2D(
             filters     = self.hparams.filters,
             kernel_size = self.hparams.kernel_size,
             use_bias    = self.hparams.conv_bias,
-            strides     = self.hparams.strides,
+            strides     = strides,
             padding     = self.hparams.padding,
             name        = 'conv1'
         )
@@ -81,41 +84,73 @@ class VisualTransformer(TransformerEncoder):
         )
         self.conv_drop  = tf.keras.layers.Dropout(self.hparams.conv_drop_rate) if self.hparams.conv_drop_rate > 0 else None
         
-        ctx_length  = (self.hparams.input_dim // self.hparams.strides) ** 2 + 1
+        self.row_embedding  = None
+        self.col_embedding  = None
+        self.class_embedding    = None
+        
+        grid_size   = self.hparams.input_dim // strides
+        ctx_length  = grid_size ** 2
+        
+        if self.add_class_embedding: ctx_length += 1
         with tf.name_scope(self.name):
-            self.class_embedding    = self.add_weight(
-                shape = (self.embedding_dim, ), name = 'class_embedding'
-            )
+            if self.add_row_embedding:
+                self.row_embedding  = self.add_weight(
+                    shape = (grid_size, self.embedding_dim), name = 'row_embedding'
+                )
+            if self.add_col_embedding:
+                self.col_embedding  = self.add_weight(
+                    shape = (grid_size, self.embedding_dim), name = 'col_embedding'
+                )
+
+            if self.add_class_embedding:
+                self.class_embedding    = self.add_weight(
+                    shape = (self.embedding_dim, ), name = 'class_embedding'
+                )
+            
             self.positional_embedding   = self.add_weight(
                 shape = (ctx_length, self.embedding_dim), name = 'positional_embedding'
             )
     
     @property
     def input_signature(self):
-        return tf.TensorSpec(shape = (None, self.input_dim, self.input_dim, 3), dtype = tf.float32)
-    
-    def compute_output(self, output, training = False, mask = None, inputs = None, ** kwargs):
-        output = super().compute_output(output, training = training, mask = mask)
-        
-        return self.embedding_head(output, training = training, mask = mask, ** kwargs)
+        return tf.TensorSpec(
+            shape = (None, self.input_dim, self.input_dim, self.hparams.input_channels),
+            dtype = tf.float32
+        )
 
     def prepare_input(self, inputs, training = False, mask = None, ** kwargs):
         embedded = self.conv(inputs)
         if self.conv_act is not None:   embedded = self.conv_act(embedded)
         if self.pooling is not None:    embedded = self.pooling(embedded)
-        embedded = tf.reshape(embedded, [tf.shape(embedded)[0], -1, tf.shape(embedded)[-1]])
         
-        embedded = tf.concat([
-            tf.broadcast_to(
-                self.class_embedding, [tf.shape(embedded)[0], 1, tf.shape(embedded)[-1]]
-            ),
-            embedded
-        ], axis = 1)
-        embedded = embedded + tf.expand_dims(self.positional_embedding, axis = 0)
+        if self.add_row_embedding:
+            embedded = embedded + tf.reshape(self.row_embedding[: tf.shape(embedded)[1]], [
+                1, tf.shape(embedded)[1], 1, self.embedding_dim
+            ])
+        if self.add_col_embedding:
+            embedded = embedded + tf.reshape(self.col_embedding[: tf.shape(embedded)[2]], [
+                1, 1, tf.shape(embedded)[2], self.embedding_dim
+            ])
+
+        embedded = tf.reshape(embedded, [tf.shape(embedded)[0], -1, self.embedding_dim])
+        
+        if self.add_class_embedding:
+            embedded = tf.concat([
+                tf.broadcast_to(
+                    self.class_embedding, [tf.shape(embedded)[0], 1, tf.shape(embedded)[-1]]
+                ),
+                embedded
+            ], axis = 1)
+        
+        embedded = embedded + tf.expand_dims(
+            self.positional_embedding[: tf.shape(embedded)[1]], axis = 0
+        )
         if self.conv_norm is not None:  embedded = self.conv_norm(embedded, training = training)
         if self.conv_drop is not None:  embedded = self.conv_drop(embedded, training = training)
         
-        embedded._keras_mask = tf.ones((tf.shape(embedded)[0], tf.shape(embedded)[1]), dtype = tf.bool)
+        embedded._keras_mask = tf.ones(
+            (tf.shape(embedded)[0], tf.shape(embedded)[1]), dtype = tf.bool
+        )
         return embedded
     
     def transfer_weights(self, pretrained, ** kwargs):
@@ -152,7 +187,7 @@ class VisualTransformer(TransformerEncoder):
         input_dim = kernel_size * grid_size
         output_dim  = state_dict["visual.proj"].shape[1]
         
-        config = HParamsVisualTransformer(
+        config = cls.default_params(
             input_dim   = input_dim,
             output_dim  = output_dim,
             output_bias = False,
@@ -176,13 +211,11 @@ class VisualTransformer(TransformerEncoder):
         return instance
 
 custom_functions    = {
+    'ViT'   : VisualTransformer,
     'VisualTransformer' : VisualTransformer
 }
 
-custom_objects  = {
-    ** custom_functions,
-    'EmbeddingHead' : EmbeddingHead
-}
+custom_objects  = custom_functions
 
 _encoders   = custom_functions
 _transformers   = _encoders
