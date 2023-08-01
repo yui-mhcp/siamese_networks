@@ -53,6 +53,7 @@ HParamsTransformerLayer = HParams(
     epsilon     = 1e-12,
     drop_rate   = 0.1,
     use_encoder_attention   = False,
+    encoder_embedding_dim   = None,
     use_causal_attention    = False,
     ffn_dim     = 1024,
     ffn_activation  = 'relu',
@@ -547,7 +548,8 @@ class TransformerBlock(tf.keras.Model):
     @property
     def dummy_encoder_output(self):
         if not self.hparams.use_encoder_attention: return None
-        return tf.random.normal((1, 16, self.embedding_dim), dtype = tf.float32)
+        emb_dim = self.hparams.encoder_embedding_dim if self.hparams.encoder_embedding_dim else self.embedding_dim
+        return tf.random.normal((1, 16, emb_dim), dtype = tf.float32)
     
     def _init_input_layers(self, ** kwargs):
         pass

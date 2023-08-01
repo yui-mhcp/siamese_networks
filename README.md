@@ -1,6 +1,6 @@
 # :yum: Siamese network
 
-**NEW : [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file ! Check it to have a global overview of the latest modifications !** :yum:
+Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications ! :yum:
 
 ## Project structure
 
@@ -22,8 +22,10 @@
 ├── loggers
 ├── models
 │   ├── siamese
+│   │   ├── audio_encoder.py    : audio encoder class (audio to audio comparison with GE2E loss)
 │   │   ├── audio_siamese.py    : audio siamese class (audio to audio comparison)
 │   │   ├── base_comparator.py  : abstract Comparator class
+│   │   ├── base_encoder.py     : abstract Encoder class
 │   │   ├── clip.py             : CLIP main class (experimental) (text to image comparison)
 │   │   ├── image_siamese.py    : image siamese class (image to image comparison)
 │   │   ├── siamese_network.py  : abstract Siamese class
@@ -84,10 +86,11 @@ Note : for [CLIP](https://openai.com/blog/clip/) models, weights are automatical
     - [x] Text - Text comparator (`TextSiamese`)
     - [x] Text - Image comparator ([CLIP](https://openai.com/blog/clip/))
     - [ ] Text - Video comparator
-- [ ] Implement a `Siamese`-like model supporting the `GE2E` loss
+- [x] Implement a `Siamese`-like model supporting the `GE2E` loss
     - [x] Implement a `data generator` that generates *N* items from the same *ID* consecutively (required by the GE2E loss)
-    - [ ] Implement a `BaseEncoder` class that is a simple `Encoder` model (in progress)
-    - [ ] Train and share encoder model trained with the GE2E loss
+    - [x] Implement a `BaseEncoder` class that is a simple `Encoder` model (in progress)
+    - [x] Implement an `AudioEncoder` model and share pretrained models / example codes
+    - [ ] Implement an `ImageEncoder` model and share pretrained models / example codes
 
 ## What is Siamese Network ?
 
@@ -156,9 +159,9 @@ This second image comes from the [fashion MNIST example](example_fashion_mnist.j
 ![An artistic representation of Fashion MNIST](plot_funny.png)
 
 
-\* I call it like this but in reality it is more *how the model represents data* :smile:
+\* I call it this way but it is actually more *how the model represents data* :smile:
 
-\*\* This is obviously not possible to represents a 64-D vector :zany_face: but we can use the [umap](https://pypi.org/project/umap-learn/) library to create 2D projection of these embeddings
+\*\* This is obviously not possible to represent a 64-D vector :zany_face: but we can use the [umap](https://pypi.org/project/umap-learn/) library to create 2D projection of these embeddings
 
 \*\*\* Reminder : in the `AudioSiamese` example, the `validation set` is composend of **new** speakers. It means the model **never** saw these speakers in its `training set` : it shows the core power of `siamese networks` to generalize to unseen labels !
 
@@ -199,7 +202,7 @@ For this purpose I designed a custom `KNN` algorithm which can take into account
 
 \*\* This feature is currently implemented directly inside the `SiameseNetwork` class and not in the `KNN`
 
-## How to evaluate Siamese Networks
+## How to evaluate Siamese Networks (and Encoder networks in general)
 
 ### Training evaluation
 
@@ -227,7 +230,7 @@ As we can see in the `example_mnist_classifier` notebook (`evaluation` section),
 
 Another interesting point is that the `classification accuracy` is not so different compared to the `binary accuracy` in training. However this property is **not** generalizable because it is not the case in the `fashion_mnist` example
 
-## Advanced usages of Siamese Networks
+## Advanced usages of Siamese Networks (and Encoder networks)
 
 As we have seen above, `siamese networks` can be used for **classification**, **clustering** \* and **similarity** scoring. 
 
