@@ -19,16 +19,14 @@ import tensorflow as tf
 
 from tqdm import tqdm
 
-from loggers import timer
+from loggers import timer, time_logger
 from custom_layers import SimilarityLayer
 from models.interfaces import BaseModel
-from utils.distance import distance, KNN
-from utils.thread_utils import Pipeline
+from utils.distance import KNN, distance
 from utils.embeddings import _embedding_filename, _default_embedding_ext, load_embedding
 from utils import plot_embedding, pad_batch
 
 logger  = logging.getLogger(__name__)
-time_logger = logging.getLogger('timer')
 
 _ab_pattern = re.compile('(^(a|b)_|_(a|b)_|_(a|b)$)')
 _default_attr_cache = {attr : attr for attr in ['a_renaming', 'b_renaming']}
