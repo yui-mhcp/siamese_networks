@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -14,12 +13,8 @@ import os
 import numpy as np
 import tensorflow as tf
 
-from custom_layers import get_activation, MultiHeadAttention
+from custom_layers import get_activation, CustomActivation, MultiHeadAttention
 from custom_architectures.current_blocks import _get_var, Conv2DBN, _get_pooling_layer
-
-def l2_normalize(x, axis = -1):
-    import tensorflow as tf
-    return tf.math.l2_normalize(x, axis = axis)
 
 class Attention2D(tf.keras.layers.Layer):
     def __init__(self, spatial_dim, embedding_dim, num_heads, output_dim = None, ** kwargs):
@@ -181,8 +176,7 @@ def ModifiedResnet(input_shape  = 224,
         input_shape[0] // 32, embedding_dim, num_heads, output_dim, name = 'attnpool'
     )(x)
 
-    if output_normalize:
-        out = tf.keras.layers.Lambda(l2_normalize)(out)
+    if output_normalize: out = CustomActivation('l2_normalize')(out)
     
     return tf.keras.Model(inputs = inputs, outputs = out, name = name)
 
@@ -224,5 +218,6 @@ custom_functions    = {
 }
 
 custom_objects      = {
+    'CustomActivation'  : CustomActivation,
     'Attention2D'   : Attention2D
 }
